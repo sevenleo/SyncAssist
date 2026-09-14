@@ -1,875 +1,893 @@
-# PLAN.md — SyncAssist: secretaria digital Trello ↔ projetos
+# PLAN.md — SyncAssist: Trello digital secretary ↔ projects
 
-Data de consolidação: 14/09/2026. Documento de especificação e execução futura.
+Consolidation date: 14/09/2026. Specification, execution and validation record.
 
-**Situação atual:** somente o planejamento foi produzido. Nenhum item de implementação abaixo está concluído. O agente implementador deverá marcar uma tarefa apenas depois de executar e validar o comportamento correspondente.
+**Current status:** the `SyncAssist 1.0.0` implementation includes the offline import flow and is ready for controlled Trello validation. The checkboxes below remain unchecked when a requirement has not been proven or belongs to real validation that has not yet been run.
 
-**Instrução ao próximo agente:** implementar este plano em etapas, preservar os arquivos existentes e registrar evidências de validação. Não reinterpretar decisões já acordadas como perguntas pendentes. Não criar commits sem autorização explícita. Este documento não autoriza experimentar alterações em cards de produção durante o desenvolvimento; usar dados simulados e, para validação real, uma lista de teste indicada pelo responsável.
+**Instruction for the execution/validation agent:** preserve existing files, complete only demonstrably pending checkboxes and record validation evidence. Do not reinterpret agreed decisions as open questions. Do not create commits without explicit authorization. This document does not authorize experiments on production cards; use simulated data and, for real validation, a test list designated by the owner.
 
-## 1. Resumo executivo
+## 1. Executive summary
 
-O usuário organiza vários projetos em um único quadro do Trello. Cada lista representa um projeto e cada card representa uma demanda. O SyncAssist será um script Python copiado para a pasta de cada projeto. A execução sincronizará a lista configurada com arquivos Markdown na pasta `PLAN/`, permitindo que humanos e agentes leiam o planejamento, editem os campos permitidos e registrem a conclusão das tarefas.
+The user organizes several projects on one Trello board. Each list represents a project and each card represents a request. SyncAssist is a Python script copied into each project's folder. A run synchronizes the configured list with Markdown files in `PLAN/`, allowing humans and agents to read the plan, edit permitted fields and record task completion.
 
-O produto deverá ser pequeno na distribuição: um `sync.py`, configuração em `.env` e nenhuma dependência externa. A sincronização bidirecional, porém, exige identidade estável, comparação com uma versão-base e tratamento explícito de conflitos e falhas parciais. Essas garantias fazem parte do MVP; não devem ser omitidas para reduzir linhas.
+The distributed product should be small: one `sync.py`, `.env` configuration and no external dependencies. Bidirectional synchronization nevertheless requires stable identity, comparison with a base version and explicit handling of conflicts and partial failures. These guarantees are part of the MVP and must not be omitted to reduce line count.
 
-### 1.1. Decisões já acordadas
+### 1.1. Agreed decisions
 
-| Tema | Decisão |
+| Topic | Decision |
 | --- | --- |
-| Tecnologia | Python 3, somente biblioteca padrão. |
-| Distribuição | Um script portátil por projeto. |
-| Correspondência projeto/lista | `TRELLO_LIST_ID` no `.env`; nomes não determinam identidade. |
-| Operação | Execução manual, automática e sem perguntas interativas. |
-| Volume esperado | Até aproximadamente 200 cards por lista; histórico e anexos podem aumentar a quantidade de dados. |
-| Sistemas | Windows, Linux e macOS. |
-| Direção | Bidirecional para os campos editáveis acordados. |
-| Conteúdo editável | Título, descrição, checklists, associação de labels e status de conclusão. |
-| Demais dados | Importar como referência somente leitura, dentro do que a API e as permissões disponibilizarem. |
-| Identidade do card | ID completo nos metadados do Markdown. |
-| Estado de sincronização | No próprio Markdown; sem banco nem arquivo global de estado. |
-| Status | `done-` corresponde à presença da label configurada; `todo-`, à ausência. |
-| Movimento de cards | Nunca mover cards para representar conclusão. |
-| Nome do arquivo | Título curto e sanitizado, atualizado automaticamente. |
-| ID no nome | Somente em colisões ou quando não houver texto útil. |
-| Alterações simultâneas | Preservar as versões e solicitar resolução explícita para aquele card. |
-| Card apagado ou movido | Retirar seu arquivo do conjunto ativo de `PLAN/`, com as salvaguardas de remoção abaixo. |
-| Arquivo apagado localmente | Recriar a partir do Trello; não apagar nem arquivar o card. |
-| Falha isolada | Continuar cards independentes, informar falha e retornar código diferente de zero. |
-| Segurança | `.env` fora do Git, configuração validada e logs sem credenciais ou corpo dos cards. |
+| Technology | Python 3, standard library only. |
+| Distribution | One portable script per project. |
+| Project/list mapping | `TRELLO_LIST_ID` in `.env`; names do not determine identity. |
+| Operation | Manual, automatic and non-interactive execution. |
+| Expected volume | Approximately 200 cards per list; history and attachments may increase the data volume. |
+| Systems | Windows, Linux and macOS. |
+| Direction | Bidirectional for the agreed editable fields. |
+| Editable content | Title, description, checklists, label associations and completion status. |
+| Local creation | Copying `PLAN/_modelo-card.md` to `todo-...md` or `done-...md`, or importing `PLAN/*.txt` with `--import`, creates a new card in the configured list; the original template is reserved and never creates a card. |
+| Other data | Import as read-only reference, within what the API and permissions provide. |
+| Card identity | Full ID in the Markdown metadata. |
+| Synchronization state | In the Markdown itself; no database or global state file. |
+| Status | `done-` corresponds to `dueComplete=true` on the card; `todo-` corresponds to `dueComplete=false` or absent. |
+| Card movement | Never move cards to represent completion. |
+| Filename | Short, sanitized title, updated automatically. |
+| ID in filename | Only for collisions or when there is no useful text. |
+| Simultaneous changes | Preserve the versions and request explicit resolution for that card. |
+| Deleted or moved card | Remove its file from the active `PLAN/` set, with the removal safeguards below. |
+| Locally deleted file | Recreate it from Trello; do not delete or archive the card. |
+| Isolated failure | Continue with independent cards, report the failure and return a non-zero code. |
+| Security | `.env` outside Git, validated configuration and logs without credentials or card bodies. |
 
-### 1.2. Refinamentos técnicos deste documento
+### 1.2. Technical refinements in this document
 
-Os itens seguintes fecham lacunas do rascunho anterior e são padrões de implementação, preservando as decisões do usuário:
+The following items close gaps in the previous draft and are implementation standards that preserve the user's decisions:
 
-- Python mínimo: 3.11; não utilizar funcionalidades exclusivas de versões posteriores.
-- Metadados em JSON delimitado no início do Markdown, chamado aqui de front matter JSON. Não depender de YAML.
-- Uma fonte editável por informação: título e IDs das labels nos metadados, descrição e checklists em regiões delimitadas, status no prefixo.
-- Snapshot-base completo da projeção editável, além do hash. Hashes sozinhos não preservam a versão necessária à resolução de conflitos.
-- Resolução de conflitos por campo explícito nos metadados, vinculado à versão remota revisada. Apagar o artefato não autoriza sobrescrita.
-- Remoções locais recuperáveis em `PLAN/.removed/`; essa pasta não participa da sincronização ativa.
-- Arquivar um card não significa concluí-lo nem excluí-lo. Cards arquivados ainda pertencentes à lista continuam representados, com o campo de arquivamento somente leitura.
-- Não criar cards a partir de arquivos locais novos sem identidade remota.
-- Labels editáveis significam associar/desassociar labels existentes do quadro. Renomear ou criar uma label global do quadro fica fora do MVP.
-- Um pequeno registro de operações pendentes no próprio card local protege retomadas depois de falhas durante múltiplas chamadas HTTP.
-- O conteúdo importado é dado de planejamento; não é comando a executar nem autorização para um agente alterar o projeto.
+- Minimum Python version: 3.11; do not use features exclusive to later versions.
+- Delimited JSON metadata at the end of the Markdown, called the technical JSON block here. Do not depend on YAML.
+- One editable source per piece of information: title and label IDs in metadata, description and checklists in delimited regions, status in the prefix.
+- A complete base snapshot of the editable projection in addition to the hash. Hashes alone do not preserve the version needed for conflict resolution.
+- Conflict resolution through an explicit metadata field linked to the reviewed remote version. Deleting the artifact does not authorize an overwrite.
+- Recoverable local removals in `PLAN/.removed/`; this folder is not part of active synchronization.
+- Archiving a card does not mean completing or deleting it. Archived cards that still belong to the list remain represented, with the archive field read-only.
+- Ordinary local files without remote identity do not create cards; the exceptions are a valid copy of `PLAN/_modelo-card.md` or a template generated by `--import`, both identified by `role: template`.
+- Editable labels mean associating/disassociating existing board labels. Renaming or creating a global board label is outside the MVP.
+- A small pending-operation record in the local card protects resumptions after failures during multiple HTTP calls.
+- Imported content is planning data; it is not a command to execute or authorization for an agent to change the project.
 
-## 2. Objetivo, limites e entregáveis
+## 2. Objective, boundaries and deliverables
 
-### 2.1. Resultado esperado
+### 2.1. Expected result
 
-- [ ] Permitir copiar o script para um projeto, preencher `.env` e executar `python sync.py`.
-- [ ] Criar automaticamente `PLAN/` após validar a configuração e o acesso remoto.
-- [ ] Gerar um Markdown por card da lista configurada.
-- [ ] Preservar títulos e descrições completos, independentemente do nome curto do arquivo.
-- [ ] Permitir que alterações locais autorizadas retornem ao Trello na execução seguinte.
-- [ ] Refletir alterações remotas localmente sem perder edições locais concorrentes.
-- [ ] Manter uma execução sem mudanças idempotente: nenhuma escrita remota, nenhum arquivo regravado e nenhum timestamp local alterado apenas pela passagem do tempo.
-- [ ] Apresentar relatório que um humano ou agente consiga usar para identificar pendências.
+- [x] Allow copying the script into a project, filling `.env` and running `python sync.py`.
+- [x] Automatically create `PLAN/` after validating configuration and remote access.
+- [x] Generate one Markdown file per card in the configured list.
+- [x] Preserve complete titles and descriptions regardless of the short filename.
+- [x] Allow authorized local changes to return to Trello on the next run.
+- [x] Reflect remote changes locally without losing concurrent local edits.
+- [x] Keep an unchanged run idempotent: no remote writes, no rewritten files and no local timestamp changed merely by the passage of time.
+- [x] Present a report that a human or agent can use to identify pending work.
+- [x] Keep `PLAN/_modelo-card.md` on every run and create a card from an explicit copy of the template.
 
-### 2.2. O que importar
+### 2.2. What to import
 
-- [ ] Campos públicos do objeto card retornados pela API: identidade, título, descrição, URLs, posições, datas, conclusão de prazo, arquivamento, capa, badges e demais propriedades disponíveis.
-- [ ] Todas as checklists e seus itens, com IDs, nomes, posições, estados e outros campos disponibilizados.
-- [ ] Labels associadas e catálogo de labels do quadro para interpretação dos IDs.
-- [ ] Comentários e histórico de ações acessíveis pelos endpoints oficiais, percorrendo todas as páginas disponíveis.
-- [ ] Membros associados e dados de identificação necessários para exibir os nomes.
-- [ ] Anexos, capas e imagens como metadados e links, sem download dos binários.
-- [ ] Valores e definições de campos personalizados quando o quadro e o token permitirem.
-- [ ] Stickers, votos e dados compartilhados de Power-Ups expostos ao token, como somente leitura.
-- [ ] Preservar campos desconhecidos do retorno em um snapshot JSON somente leitura, evitando descartar informações simplesmente por não haver um renderizador específico.
-- [ ] Informar recursos não expostos, não suportados ou inacessíveis; não prometer histórico completo de tudo que já aconteceu no Trello.
-- [ ] Diferenciar recurso vazio de recurso cuja consulta falhou.
+- [ ] Public fields returned for the card object by the API: identity, title, description, URLs, positions, dates, due completion, archiving, cover, badges and other available properties.
+- [ ] All checklists and their items, with IDs, names, positions, states and other exposed fields.
+- [ ] Associated labels and the board label catalog for interpreting IDs.
+- [ ] Comments and action history accessible through official endpoints, walking all available pages.
+- [ ] Associated members and the identification data needed to display names.
+- [ ] Attachments, covers and images as metadata and links, without downloading binaries.
+- [ ] Custom-field values and definitions when the board and token allow them.
+- [ ] Stickers, votes and Power-Up shared data exposed to the token, as read-only data.
+- [ ] Preserve unknown response fields in a read-only JSON snapshot instead of discarding information simply because no specific renderer exists.
+- [ ] Report resources that are not exposed, supported or accessible; do not promise a complete history of everything that ever happened in Trello.
+- [ ] Distinguish an empty resource from a resource whose query failed.
 
-### 2.3. Fora do MVP
+### 2.3. Outside the MVP
 
-- [ ] Não implementar daemon, agendamento, webhooks, interface gráfica, painel web ou API própria.
-- [ ] Não adicionar dependências, SDK do Trello, banco de dados ou empacotador de executável.
-- [ ] Não criar, mover, apagar ou arquivar cards a partir de comandos locais.
-- [ ] Não editar comentários, membros, datas, anexos, capa, votos, campos personalizados ou dados de Power-Ups remotamente.
-- [ ] Não usar OCR, baixar imagens ou consultar URLs presentes em títulos e descrições.
-- [ ] Não implementar `--dry-run` nem confirmação interativa, conforme a escolha de execução automática.
-- [ ] Não implementar mesclagem automática por linha ou por campo entre duas versões editáveis divergentes.
-- [ ] Não impor limite artificial de 200 cards: esse número é a escala de referência, não um ponto de truncamento.
+- [ ] Do not implement a daemon, scheduling, webhooks, graphical interface, web dashboard or custom API.
+- [ ] Do not add dependencies, a Trello SDK, a database or an executable packager.
+- [ ] Do not move, delete or archive cards from local commands; creation is allowed only through an explicit template copy or the deliberate `--import` command.
+- [ ] Do not edit comments, members, dates, attachments, covers, votes, custom fields or Power-Up data remotely.
+- [ ] Do not use OCR, download images or query URLs present in titles and descriptions.
+- [ ] Do not implement `--dry-run` or interactive confirmation, according to the automatic-execution decision.
+- [ ] Do not implement automatic line-level or field-level merging between two divergent editable versions.
+- [ ] Do not impose an artificial limit of 200 cards: this number is the reference scale, not a truncation point.
 
-### 2.4. Artefatos futuros
+### 2.4. Future artifacts
 
 ```text
-raiz-do-projeto/
-├── sync.py                  # implementação distribuível
-├── .env                     # preenchido localmente; nunca versionar
-├── .env.example             # apenas nomes das variáveis e exemplos não sensíveis
-├── .gitignore               # regras mescladas às existentes
-├── README.md                # instalação, contrato de edição e operação
-├── PLAN.md                  # este roteiro de implementação
-├── test_sync.py             # testes locais com biblioteca padrão
-└── PLAN/                    # gerado na execução do produto
-    ├── todo-titulo-curto.md
-    ├── done-outro-titulo.md
-    ├── .conflicts/          # versões e instruções para revisão
-    ├── .removed/            # arquivos retirados do conjunto ativo, recuperáveis
-    └── .sync.lock           # somente enquanto uma execução estiver ativa
+project-root/
+├── sync.py                  # distributable implementation
+├── .env                     # filled locally; never commit
+├── .env.example             # variable names and non-sensitive examples only
+├── .gitignore               # rules merged with existing rules
+├── README.md                # installation, editing contract and operation
+├── PLAN.md                  # this implementation plan
+├── test_sync.py             # local standard-library tests
+└── PLAN/                    # generated when the product runs
+    ├── todo-short-title.md
+    ├── done-another-title.md
+    ├── _modelo-card.md       # reserved template for explicit card creation
+    ├── .conflicts/          # versions and review instructions
+    ├── .removed/            # recoverable files removed from the active set
+    ├── .sync-staging/       # temporary rename-swap files; empty after success
+    └── .sync.lock           # only while a run is active
 ```
 
-`PLAN.md` é o planejamento do SyncAssist. `PLAN/` é a pasta que o produto gerará para os cards. São objetos distintos. Neste trabalho de documentação, criar somente `PLAN.md`; todos os demais artefatos acima pertencem à implementação futura.
+`PLAN.md` is the SyncAssist plan. `PLAN/` is the folder the product generates for cards and the reserved template. They are distinct objects. The implementation delivers `sync.py`, `.env.example`, `.gitignore`, `README.md` and `test_sync.py`; `PLAN/` is still created only during a run with valid configuration.
 
-## 3. Riscos e mitigações obrigatórias
+## 3. Required risks and mitigations
 
-| Risco concreto | Comportamento exigido |
+| Concrete risk | Required behavior |
 | --- | --- |
-| Sobrescrever texto editado nos dois lados | Comparação de três versões: base, local e remota; conflito bloqueia apenas o card. |
-| Exclusão em massa após falha de listagem | Separar falha de consulta de lista vazia; desabilitar remoções se o inventário não estiver completo. |
-| Confundir 404 com exclusão | Não tratar 404 isolado como prova; exigir inventário íntegro e retirar de forma recuperável quando a identidade não estiver mais acessível. |
-| Repetir criação de checklist após timeout | Persistir intenção antes da chamada; não repetir POST de resultado incerto automaticamente. |
-| Perder IDs de subtarefas | Usar identificadores explícitos para checklists e itens, nunca casar somente por texto. |
-| Usar slug como identidade | Localizar pelo ID completo do card no front matter. |
-| Colisões e nomes incompatíveis com Windows | Sanitizar, truncar, comparar sem distinção de caixa e acrescentar ID somente quando necessário. |
-| Alterar o arquivo enquanto o script trabalha | Revalidar bytes antes da substituição; não sobrescrever edição concorrente. |
-| Dois processos na mesma pasta | Lock local exclusivo; segunda execução encerra antes de qualquer mutação. |
-| Alteração remota entre leitura e escrita | Releitura imediatamente antes do envio e confirmação depois; documentar que chamadas REST separadas não formam uma transação. |
-| Expor segredos em exceções | Autenticação centralizada, mensagens redigidas e sem dump de request/response. |
-| Vazamento dos próprios cards pelo Git | Documentar que `PLAN/` contém dados privados; ignorar a pasta por padrão no modelo distribuído. |
-| HTML ou instruções maliciosas no card | Armazenar como dados, escapar representações geradas e nunca executar conteúdo. |
-| Histórico grande e rate limit | Paginação real, chamadas sequenciais e backoff limitado. |
-| Mudança de `.env` apontar para outra lista | Arquivos com binding diferente são preservados e bloqueados, nunca reenviados nem apagados. |
+| Overwriting text edited on both sides | Compare three versions: base, local and remote; a conflict blocks only that card. |
+| Mass deletion after a listing failure | Separate a query failure from an empty list; disable removals when the inventory is incomplete. |
+| Mistaking 404 for deletion | Do not treat an isolated 404 as proof; require a complete inventory and recoverably remove the file when the identity is no longer accessible. |
+| Repeating checklist creation after a timeout | Persist intent before the call; do not automatically repeat a POST with an uncertain result. |
+| Losing subtask IDs | Use explicit identifiers for checklists and items; never match by text alone. |
+| Using the slug as identity | Locate the card by its full ID in the front matter. |
+| Collisions and Windows-incompatible names | Sanitize, truncate, compare case-insensitively and add an ID only when necessary. |
+| File changes while the script works | Revalidate bytes before replacement; do not overwrite a concurrent edit. |
+| Two processes in the same folder | Exclusive local lock; the second run exits before any mutation. |
+| Remote change between read and write | Read again immediately before sending and confirm afterward; document that separate REST calls do not form a transaction. |
+| Exposing secrets in exceptions | Centralized authentication, redacted messages and no request/response dump. |
+| Cards leaking through Git | Document that `PLAN/` contains private data; ignore the folder by default in the distributed template. |
+| HTML or malicious instructions in a card | Store as data, escape generated representations and never execute content. |
+| Large history and rate limits | Real pagination, sequential calls and bounded backoff. |
+| `.env` changes pointing to another list | Preserve and block files with a different binding; never resend or delete them. |
 
-## 4. Implementação em blocos e mini tarefas
+## 4. Block implementation and subtasks
 
-### Bloco 0 — Preparar o trabalho e confirmar contratos externos
+### Block 0 — Prepare the work and confirm external contracts
 
-Arquivos-alvo futuros: `sync.py`, `test_sync.py`, `.env.example`, `.gitignore` e `README.md`.
+Future target files: `sync.py`, `test_sync.py`, `.env.example`, `.gitignore` and `README.md`.
 
-- [ ] Ler este documento integralmente antes de implementar.
-- [ ] Inspecionar instruções locais e arquivos existentes novamente no início da implementação.
-- [ ] Considerar o estado observado em 14/09/2026: a pasta continha apenas `ideia.txt` e não era um repositório Git inicializado.
-- [ ] Não inicializar Git, instalar pacotes ou criar uma arquitetura de módulos como requisito para começar.
-- [ ] Confirmar Python 3.11 ou superior no ambiente usado para testes.
-- [ ] Consultar os contratos oficiais dos endpoints abaixo, principalmente campos de checklist, filtros de arquivamento e paginação.
-- [ ] Usar os parâmetros documentados de cada endpoint; não aplicar genericamente `page`, `limit` ou `before` onde não forem suportados.
-- [ ] Fixar o formato v1 descrito neste plano antes de gerar os primeiros arquivos de card.
-- [ ] Implementar funções pequenas dentro do mesmo script, com separação lógica entre HTTP, parsing, normalização, decisão e aplicação.
-- [ ] Manter execução dentro de `main()` e proteger a entrada para que importar o módulo em testes não realize rede ou escrita.
-- [ ] Evitar interfaces abstratas, factories, registries ou classes que apenas encapsulem uma única função.
+- [ ] Read this entire document before implementing.
+- [ ] Reinspect local instructions and existing files at the start of implementation.
+- [ ] Consider the state observed on 14/09/2026: the folder contained only `ideia.txt` and was not an initialized Git repository.
+- [ ] Do not initialize Git, install packages or create a module architecture as a prerequisite for starting.
+- [ ] Confirm Python 3.11 or newer in the environment used for tests.
+- [ ] Check the official endpoint contracts below, especially checklist fields, archive filters and pagination.
+- [ ] Use each endpoint's documented parameters; do not apply `page`, `limit` or `before` generically where unsupported.
+- [ ] Fix the v1 format described in this plan before generating the first card files.
+- [ ] Implement small functions within the same script, with logical separation between HTTP, parsing, normalization, decision and application.
+- [ ] Keep execution inside `main()` and protect module entry so importing it in tests performs no network or file write.
+- [ ] Avoid abstract interfaces, factories, registries or classes that merely wrap one function.
 
-**Saída verificável do bloco:** contratos externos consultados e responsabilidades internas claras; ainda não é necessário conectar a uma conta real.
+**Verifiable output of the block:** external contracts have been checked and internal responsibilities are clear; connecting to a real account is not yet required.
 
-### Bloco 1 — Configuração, raiz e binding do projeto
+### Block 1 — Project configuration, root and binding
 
-#### 1.1. Variáveis
+#### 1.1. Variables
 
 ```dotenv
 TRELLO_API_KEY=
 TRELLO_TOKEN=
 TRELLO_LIST_ID=
-TRELLO_DONE_LABEL_ID=
 ```
 
-- [ ] Resolver a raiz pela localização real de `sync.py`, usando `Path(__file__).resolve().parent`.
-- [ ] Resolver `.env` e `PLAN/` nessa raiz, mesmo quando o script for chamado por caminho absoluto a partir de outra pasta.
-- [ ] Ler `.env` em UTF-8, aceitando BOM inicial.
-- [ ] Aceitar linhas vazias, comentários de linha inteira e atribuições `CHAVE=valor`.
-- [ ] Separar a atribuição somente no primeiro `=`.
-- [ ] Remover espaços externos; remover um par correspondente de aspas simples ou duplas.
-- [ ] Não executar shell, expandir variáveis, interpretar escapes ou cortar `#` dentro de um valor.
-- [ ] Rejeitar aspas sem fechamento e duplicidade de uma das quatro chaves do SyncAssist.
-- [ ] Ignorar entradas de outros aplicativos em um `.env` compartilhado; não alterá-las.
-- [ ] Usar somente os quatro valores do `.env` para esta ferramenta; não aplicar fallback silencioso a variáveis de ambiente de outro projeto.
-- [ ] Validar campos obrigatórios não vazios e IDs no formato completo aceito pela API; rejeitar controles e quebras de linha nas credenciais.
-- [ ] Não impor um tamanho inventado para token; validar seu acesso com a API.
-- [ ] Mostrar apenas o nome da variável inválida, nunca seu conteúdo.
+- [x] Resolve the root from the actual location of `sync.py`, using `Path(__file__).resolve().parent`.
+- [x] Resolve `.env` and `PLAN/` under that root even when the script is called by an absolute path from another folder.
+- [x] Read `.env` as UTF-8, accepting an initial BOM.
+- [x] Accept blank lines, full-line comments and `KEY=value` assignments.
+- [x] Split an assignment only at the first `=`.
+- [x] Strip outer whitespace; remove one matching pair of single or double quotes.
+- [x] Do not execute a shell, expand variables, interpret escapes or cut `#` from a value.
+- [x] Reject unclosed quotes and duplicate SyncAssist keys.
+- [x] Ignore entries for other applications in a shared `.env`; do not alter them.
+- [x] Use only the three `.env` values for this tool; do not silently fall back to another project's environment variables.
+- [x] Validate required non-empty fields and IDs in the complete format accepted by the API; reject controls and line breaks in credentials.
+- [x] Do not invent a token length limit; validate access through the API.
+- [x] Show only the invalid variable name, never its value.
 
-#### 1.2. Validação remota e vínculo local
+#### 1.2. Remote validation and local binding
 
-- [ ] Consultar a lista configurada para obter nome, `idBoard` e situação de arquivamento.
-- [ ] Consultar o catálogo de labels do quadro e verificar se `TRELLO_DONE_LABEL_ID` pertence a ele.
-- [ ] Não criar automaticamente uma label ausente, nem escolher uma pelo nome quando o ID falhar.
-- [ ] Encerrar com erro de configuração se o binding não puder ser validado.
-- [ ] Gravar no metadado de cada card o ID do quadro, o ID da lista e o ID da label usada para conclusão.
-- [ ] Comparar esses três IDs com a configuração em toda execução.
-- [ ] Se houver arquivos ativos com binding diferente, encerrar antes de mutações e explicar quais arquivos precisam de migração manual.
-- [ ] Atualizar somente o nome informativo da lista quando ela for renomeada, preservando o ID.
-- [ ] Se o quadro ou a lista inteira estiver arquivado, encerrar com diagnóstico e sem remover a coleção local; reabrir o escopo é decisão do responsável.
+- [x] Query the configured list to obtain its name, `idBoard` and archive status.
+- [x] Query the board label catalog to validate common labels edited locally.
+- [x] Do not automatically create a completion label or choose a label by name: completion uses `dueComplete`.
+- [x] Exit with a configuration error if the binding cannot be validated.
+- [x] Store the board ID and list ID in each card's metadata.
+- [x] Compare both IDs with the configuration on every run.
+- [x] If active files have a different binding, stop before mutations and explain which files need manual migration.
+- [x] Update only the informational list name when the list is renamed, preserving its ID.
+- [x] If the board or entire list is archived, stop with a diagnosis and do not remove the local collection; reopening the scope is the owner's decision.
 
-**Saída verificável do bloco:** executar de outra pasta encontra o mesmo `.env`; configuração inválida não altera arquivos nem cards.
+**Verifiable output of the block:** running from another folder finds the same `.env`; invalid configuration changes neither files nor cards.
 
-### Bloco 2 — Cliente HTTP e inventário remoto
+### Block 2 — HTTP client and remote inventory
 
-#### 2.1. Transporte
+#### 2.1. Transport
 
-- [ ] Usar `urllib.request`, `urllib.error`, `urllib.parse`, `json`, `time` e demais módulos padrão necessários.
-- [ ] Fixar origem HTTPS `https://api.trello.com/1`; nunca usar o campo URL de um card como destino de uma chamada autenticada.
-- [ ] Usar o cabeçalho de autorização com key/token no formato aceito pelo Trello, centralizado em uma função; validar caracteres antes de interpolar.
-- [ ] Manter validação TLS padrão habilitada e impedir redirecionamento autenticado para outra origem.
-- [ ] Definir timeout de 30 segundos por tentativa.
-- [ ] Definir no máximo três tentativas totais para GET e operações comprovadamente repetíveis.
-- [ ] Usar esperas de 1 e 2 segundos para falhas transitórias; em 429, respeitar `Retry-After` quando válido ou esperar 10 segundos, sem loop infinito.
-- [ ] Espaçar o início das requisições em pelo menos 0,2 segundo na instância local e tratar 429 mesmo assim, pois o token pode ser compartilhado com outros projetos.
-- [ ] Tratar HTTP 400 como erro da operação, sem repetir a mesma entrada inválida.
-- [ ] Tratar 401 como falha global de autenticação; encerrar as próximas mutações.
-- [ ] Tratar 403 global na validação do escopo como fatal; 403 de recurso específico deve preservar o card e permitir processar os outros.
-- [ ] Não classificar erro HTTP, timeout, JSON inválido ou formato inesperado como coleção vazia.
-- [ ] Não repetir uma criação POST quando for incerto se o servidor a aplicou.
-- [ ] Confirmar estado por GET antes de repetir atualização, associação de label ou exclusão de subitem que tenha resultado incerto.
-- [ ] Redigir mensagens HTTP antes de registrar; não imprimir URL autenticada, corpo remoto ou traceback contendo credenciais.
+- [x] Use `urllib.request`, `urllib.error`, `urllib.parse`, `json`, `time` and other required standard-library modules.
+- [x] Fix the HTTPS origin to `https://api.trello.com/1`; never use a card URL field as the destination of an authenticated call.
+- [x] Use Trello's accepted key/token authorization header format, centralized in one function; validate characters before interpolation.
+- [x] Keep standard TLS validation enabled and prevent authenticated redirects to another origin.
+- [x] Set a 30-second timeout per attempt.
+- [x] Set at most three total attempts for GET and demonstrably repeatable operations.
+- [x] Use 1- and 2-second waits for transient failures; for 429, honor a valid `Retry-After` or wait 10 seconds, without an infinite loop.
+- [x] Space request starts by at least 0.2 seconds in the local instance and handle 429 anyway, because the token may be shared with other projects.
+- [x] Treat HTTP 400 as an operation error without repeating the same invalid input.
+- [x] Treat 401 as a global authentication failure and stop subsequent mutations.
+- [x] Treat a global 403 during scope validation as fatal; a resource-specific 403 must preserve that card and allow the others to proceed.
+- [x] Do not classify an HTTP error, timeout, invalid JSON or unexpected format as an empty collection.
+- [x] Do not repeat a POST creation when it is uncertain whether the server applied it.
+- [ ] Confirm state with GET before repeating an update, label association or sub-item deletion with an uncertain result.
+- [x] Redact HTTP messages before recording them; do not print an authenticated URL, remote body or traceback containing credentials.
 
-A API aceita autenticação por key/token; o formato de cabeçalho e o escopo de autorização devem seguir a [documentação oficial de autorização](https://developer.atlassian.com/cloud/trello/guides/rest-api/authorization/). A política local de tentativas e espaçamento acima é uma decisão deste projeto, considerando os [limites oficiais de requisição](https://developer.atlassian.com/cloud/trello/guides/rest-api/rate-limits/).
+The API accepts key/token authentication; the header format and authorization scope must follow the [official authorization documentation](https://developer.atlassian.com/cloud/trello/guides/rest-api/authorization/). The retry and spacing policy above is a project decision that considers the [official request limits](https://developer.atlassian.com/cloud/trello/guides/rest-api/rate-limits/).
 
-#### 2.2. Endpoints de referência
+#### 2.2. Reference endpoints
 
-Os caminhos abaixo são relativos à origem fixa. Validar parâmetros e respostas na implementação; a tabela não autoriza enviar campos arbitrários do snapshot.
+The paths below are relative to the fixed origin. Validate parameters and responses in the implementation; the table does not authorize sending arbitrary snapshot fields.
 
-| Finalidade | Método e recurso |
+| Purpose | Method and resource |
 | --- | --- |
-| Ler configuração da lista | `GET /lists/{id}` |
-| Listar cards da lista | `GET /lists/{id}/cards` |
-| Inventariar arquivados quando necessário | `GET /boards/{id}/cards` com filtro documentado que inclua todos, restringindo por `idList` localmente |
-| Ler card | `GET /cards/{id}` |
-| Ler checklists | `GET /cards/{id}/checklists` |
-| Ler histórico | `GET /cards/{id}/actions` |
-| Ler anexos e membros | `GET /cards/{id}/attachments` e `GET /cards/{id}/members` |
-| Ler labels disponíveis | `GET /boards/{id}/labels` |
-| Alterar título/descrição | `PUT /cards/{id}` com campos explicitamente permitidos |
-| Associar/desassociar label | `POST /cards/{id}/idLabels` e `DELETE /cards/{id}/idLabels/{idLabel}` |
-| Criar/alterar/excluir checklist | `POST /checklists`, `PUT /checklists/{id}`, `DELETE /checklists/{id}` |
-| Criar item | `POST /checklists/{id}/checkItems` |
-| Alterar item | `PUT /cards/{id}/checkItem/{idCheckItem}` |
-| Excluir item | `DELETE /checklists/{id}/checkItems/{idCheckItem}` |
+| Read list configuration | `GET /lists/{id}` |
+| List cards in a list | `GET /lists/{id}/cards` |
+| Inventory archived cards when necessary | `GET /boards/{id}/cards/all` with documented pagination, filtering locally by `idList` |
+| Read a card | `GET /cards/{id}` |
+| Read checklists | `GET /cards/{id}/checklists` |
+| Read history | `GET /cards/{id}/actions` |
+| Read attachments and members | `GET /cards/{id}/attachments` and `GET /cards/{id}/members` |
+| Read available labels | `GET /boards/{id}/labels` |
+| Create a card from a template copy | `POST /cards` with `idList`, `name`, `desc` and, when applicable, `due`/`dueComplete` |
+| Change title/description | `PUT /cards/{id}` with explicitly permitted fields |
+| Associate/disassociate a label | `POST /cards/{id}/idLabels` and `DELETE /cards/{id}/idLabels/{idLabel}` |
+| Create/update/delete a checklist | `POST /checklists`, `PUT /checklists/{id}`, `DELETE /checklists/{id}` |
+| Create an item | `POST /checklists/{id}/checkItems` |
+| Update an item | `PUT /cards/{id}/checkItem/{idCheckItem}` |
+| Delete an item | `DELETE /checklists/{id}/checkItems/{idCheckItem}` |
 
-Referências dos contratos: [listas](https://developer.atlassian.com/cloud/trello/rest/api-group-lists/), [quadros](https://developer.atlassian.com/cloud/trello/rest/api-group-boards/), [cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/) e [checklists](https://developer.atlassian.com/cloud/trello/rest/api-group-checklists/).
+Contract references: [lists](https://developer.atlassian.com/cloud/trello/rest/api-group-lists/), [boards](https://developer.atlassian.com/cloud/trello/rest/api-group-boards/), [cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/) and [checklists](https://developer.atlassian.com/cloud/trello/rest/api-group-checklists/).
 
-#### 2.3. Inventário completo e enriquecimento
+#### 2.3. Complete inventory and enrichment
 
-- [ ] Obter a relação completa de IDs do escopo antes de decidir remoções locais.
-- [ ] Incluir cards arquivados ainda vinculados à lista; validar essa cobertura em teste de integração, sem presumir que a consulta padrão da lista os inclui.
-- [ ] Se necessário, consultar cards do quadro com o filtro suportado para todos e reter apenas os cujo `idList` coincide com a configuração.
-- [ ] Não armazenar nem renderizar conteúdo de cards de outras listas ao usar o inventário do quadro.
-- [ ] Deduplicar resultados por ID; tratar IDs repetidos com dados incompatíveis como erro de inventário.
-- [ ] Consultar recursos de cada card e manter em memória o snapshot remoto completo daquela execução.
-- [ ] Paginar ações com o cursor oficial, avançando pelo ID da última ação; detectar cursor repetido e terminar somente quando a fonte estiver esgotada.
-- [ ] Buscar todas as páginas de labels e outros recursos que exponham paginação.
-- [ ] Ordenar ações de forma estável por data e ID; não depender da ordem de chegada de requisições.
-- [ ] Não reconstruir o estado atual de checklists a partir do histórico; ler seus objetos atuais.
-- [ ] Preservar dados de uma seção anterior quando um recurso complementar falhar; registrar a falha e não chamar essa coleta de completa.
-- [ ] Bloquear a escrita daquele card no ciclo quando um recurso necessário ao contrato estiver incompleto.
-- [ ] Distinguir recurso explicitamente não suportado de falha transitória: registrar indisponibilidade conhecida no snapshot; não fabricar uma coleção vazia.
-- [ ] Não truncar silenciosamente comentários, descrições, títulos ou histórico para cumprir metas de desempenho.
+- [x] Obtain the complete set of IDs in scope before deciding local removals.
+- [x] Include archived cards still linked to the list; validate this coverage in an integration test without assuming the standard list query includes them.
+- [x] If necessary, query board cards with the supported all-cards filter and retain only those whose `idList` matches the configuration.
+- [x] Do not store or render content from other lists when using the board inventory.
+- [x] Deduplicate results by ID; treat repeated IDs with incompatible data as an inventory error.
+- [x] Query each card's resources and keep the complete remote snapshot for that run in memory.
+- [x] Paginate actions with the official cursor, advancing by the last action ID; detect a repeated cursor and stop only when the source is exhausted.
+- [ ] Fetch every page of labels and other resources that expose pagination.
+- [x] Sort actions stably by date and ID; do not depend on request arrival order.
+- [x] Do not reconstruct current checklist state from history; read the current objects.
+- [ ] Preserve data from a previous section when a complementary resource fails; record the failure and do not call the collection complete.
+- [x] Block writing that card during the cycle when a resource required by the contract is incomplete.
+- [ ] Distinguish an explicitly unsupported resource from a transient failure: record known unavailability in the snapshot; do not fabricate an empty collection.
+- [x] Do not silently truncate comments, descriptions, titles or history to meet performance goals.
 
-O cursor de ações deve seguir o mecanismo descrito na [introdução oficial da API](https://developer.atlassian.com/cloud/trello/guides/rest-api/api-introduction/). “Todos os dados” neste produto significa os dados de card e recursos associados expostos ao token, e não acesso a histórico privado ou conteúdo binário indisponível.
+The action cursor must follow the mechanism described in the [official API introduction](https://developer.atlassian.com/cloud/trello/guides/rest-api/api-introduction/). “All data” in this product means card data and associated resources exposed to the token, not access to private history or unavailable binary content.
 
-**Saída verificável do bloco:** uma resposta incompleta jamais habilita limpeza local; cards arquivados e históricos paginados são cobertos.
+**Verifiable output of the block:** an incomplete response never enables local cleanup; archived cards and paginated histories are covered.
 
-### Bloco 3 — Contrato dos arquivos Markdown
+### Block 3 — Markdown file contract
 
-#### 3.1. Identidade e regiões
+#### 3.1. Identity and regions
 
-- [ ] Usar UTF-8 e gerar quebras de linha LF; aceitar CRLF ao ler.
-- [ ] Reconhecer arquivo gerenciado somente quando houver marcador inicial, JSON válido, `managed_by: "syncassist"`, `role: "card"`, versão suportada e identidade válida.
-- [ ] Tratar arquivo com marcador do SyncAssist e JSON inválido como arquivo gerenciado corrompido; não ignorá-lo e depois sobrescrevê-lo com uma importação nova.
-- [ ] Manter o front matter no início do arquivo, delimitado por `<!-- syncassist:metadata` e `syncassist:end -->`, em linhas próprias.
-- [ ] Decodificar o objeto JSON por estrutura, sem `eval` e sem executar instruções do documento.
-- [ ] Escapar `<`, `>` e `&` na serialização de JSON embutido em comentário HTML, preservando os valores após decodificação.
-- [ ] Gerar um `section_token` aleatório em hexadecimal, fixo por arquivo, para identificar as regiões de descrição, checklists e referência.
-- [ ] Utilizar marcadores em linhas próprias no formato `<!-- syncassist:<token>:description:begin -->` e `<!-- syncassist:<token>:description:end -->`; aplicar a mesma convenção a `checklists` e `reference`.
-- [ ] Garantir na geração que os delimitadores escolhidos não ocorram literalmente no conteúdo remoto. Em colisão, escolher outro token e atualizar todos os marcadores numa única gravação.
-- [ ] Na leitura, exigir cada região exatamente uma vez, na ordem definida. Marcadores ausentes, repetidos ou truncados bloqueiam o card.
-- [ ] Não localizar regiões apenas por títulos como `## Descrição`, porque o usuário pode ter esses mesmos títulos dentro da descrição.
-- [ ] Rejeitar alterações não suportadas na estrutura do documento com mensagem objetiva; não descartá-las silenciosamente.
+- [x] Use UTF-8 and generate LF line endings; accept CRLF when reading.
+- [x] Recognize a managed file only when it has the initial marker, valid JSON, `managed_by: "syncassist"`, `role: "card"`, a supported version and valid identity.
+- [x] Treat a file with a SyncAssist marker and invalid JSON as a corrupted managed file; do not ignore it and later overwrite it with a new import.
+- [x] Keep the technical block at the end of the file, delimited by `<!-- syncassist:metadata` and `syncassist:end -->` on their own lines.
+- [x] Decode the JSON object structurally, without `eval` and without executing document instructions.
+- [x] Escape `<`, `>` and `&` when serializing JSON embedded in an HTML comment, preserving values after decoding.
+- [x] Generate a random hexadecimal `section_token`, fixed per file, to identify description, checklist and reference regions.
+- [x] Use markers on their own lines in the format `<!-- syncassist:<token>:summary:begin -->`, `description`, `checklists` and `comments`, always with matching `begin`/`end` delimiters.
+- [ ] Ensure during generation that the selected delimiters do not literally occur in remote content. On collision, choose another token and update all markers in one write.
+- [ ] On reading, require each region exactly once and in the defined order. Missing, repeated or truncated markers block the card.
+- [x] Do not locate regions only by headings such as `## Description`, because the user may have the same headings inside the description.
+- [x] Reject unsupported document-structure changes with an objective message; do not silently discard them.
 
-#### 3.2. Campos obrigatórios do front matter v1
+#### 3.2. Required fields in technical block v1
 
-| Campo | Tipo / responsabilidade |
+| Field | Type / responsibility |
 | --- | --- |
-| `managed_by` | String fixa `syncassist`, gerada pela ferramenta. |
-| `schema_version` | Inteiro `1`; versões desconhecidas bloqueiam o arquivo. |
-| `role` | String `card`; conflitos usam papel próprio. Backups preservam os bytes originais e são ignorados pela localização em subpasta. |
-| `trello_card_id` | ID completo e imutável do card. |
-| `trello_board_id` | ID do quadro validado na origem. |
-| `trello_list_id` | ID da lista configurada; não editável como comando de movimento. |
-| `trello_list_name` | Nome informativo atual da lista. |
-| `trello_done_label_id` | Label que define a semântica de conclusão deste arquivo. |
-| `trello_url` | Link informativo para abrir o card; não é destino autenticado. |
-| `section_token` | Token dos delimitadores internos. |
-| `status` | Espelho informativo do último status sincronizado; não é a entrada editável de conclusão. |
-| `filename` | Objeto gerado com `slug` e `suffix`, para manter nomes estáveis após desambiguação. |
-| `content.title` | Título completo, string editável e única fonte local do título. |
-| `content.label_ids` | Array editável de IDs das labels comuns; exclui a label de conclusão. |
-| `sync.last_synced_at` | Data UTC em ISO 8601 da última sincronização confirmada daquele conteúdo. |
-| `sync.base` | Snapshot da projeção editável comum à última sincronização bem-sucedida. |
-| `sync.base_hash` | SHA-256 da serialização canônica de `sync.base`. |
-| `sync.reference_hash` | Hash da região somente leitura gerada na última versão, para detectar edição local indevida. |
-| `sync.pending` | `null` normalmente; objeto de retomada quando houver lote remoto em andamento. |
-| `sync.conflict` | `null` normalmente; identidade e fingerprint do conflito em aberto. |
-| `sync.resolution` | `null` normalmente; decisão explícita descrita no Bloco 8. |
+| `managed_by` | Fixed `syncassist` string generated by the tool. |
+| `schema_version` | Integer `1`; unknown versions block the file. |
+| `role` | `card` string; conflicts use their own role. Backups preserve original bytes and are ignored because they live in a subfolder. |
+| `trello_card_id` | Full, immutable card ID. |
+| `trello_board_id` | Board ID validated at the origin. |
+| `trello_list_id` | Configured list ID; not editable as a movement command. |
+| `trello_list_name` | Current informational list name. |
+| `trello_url` | Informational link for opening the card; not an authenticated destination. |
+| `section_token` | Token for internal delimiters. |
+| `status` | Informational mirror of the last synchronized status; not the editable completion input. |
+| `filename` | Generated object with `slug` and `suffix`, keeping names stable after disambiguation. |
+| `content.title` | Full title, editable string and single local source of the title. |
+| `content.label_ids` | Editable array of associated label IDs, including a label named `Done`. |
+| `sync.last_synced_at` | UTC ISO 8601 date of the last confirmed synchronization for that content. |
+| `sync.base` | Snapshot of the editable projection from the last successful synchronization. |
+| `sync.base_hash` | SHA-256 of the canonical serialization of `sync.base`. |
+| `sync.reference_hash` | Hash of the read-only region generated in the last version, to detect improper local edits. |
+| `sync.pending` | Normally `null`; resumable object when a remote batch is in progress. |
+| `sync.conflict` | Normally `null`; identity and fingerprint of the open conflict. |
+| `sync.resolution` | Normally `null`; explicit decision described in Block 8. |
 
-- [ ] Validar tipos, valores obrigatórios, unicidade de IDs e integridade de `base_hash` antes de comparar versões.
-- [ ] Preservar campos remotos desconhecidos no snapshot de referência, mas rejeitar versão de schema local desconhecida.
-- [ ] Não apresentar o hash como assinatura de segurança: ele detecta inconsistência e mudança, não prova autenticidade contra adulteração deliberada.
-- [ ] Não confiar em IDs editados manualmente como autorização para acessar outro card: validar binding remoto e pertencimento antes de qualquer escrita.
-- [ ] Não manter cópias editáveis concorrentes da descrição ou do título em dois locais do documento.
+- [ ] Validate types, required values, ID uniqueness and `base_hash` integrity before comparing versions.
+- [ ] Preserve unknown remote fields in the reference snapshot, but reject an unknown local schema version.
+- [ ] Do not present the hash as a security signature: it detects inconsistency and change, but does not prove authenticity against deliberate tampering.
+- [ ] Do not trust manually edited IDs as authorization to access another card: validate remote binding and ownership before any write.
+- [ ] Do not keep competing editable copies of the description or title in two document locations.
 
-#### 3.3. Layout e responsabilidade de edição
+#### 3.3. Layout and editing responsibility
 
-O documento seguirá esta ordem: front matter JSON; título visual gerado; região de descrição; região de checklists; região somente leitura com labels legíveis, comentários, anexos, membros, datas, histórico e snapshot JSON completo dos recursos importados.
+The document follows this order: editable visual title; human summary with status, due date, comments and link; editable description and checklist regions; readable read-only comments; technical JSON block at the end with identity and the complete snapshot of imported resources.
 
-- [ ] Gerar o título visual a partir de `content.title`, escapando Markdown/HTML para representação segura.
-- [ ] Explicar junto do título que a alteração do título se faz em `content.title`; editar apenas o cabeçalho visual é alteração não suportada.
-- [ ] Preservar a descrição como Markdown bruto entre seus delimitadores, incluindo imagens, listas, tabelas, blocos de código, espaços finais e linhas vazias.
-- [ ] Definir uma quebra estrutural depois do marcador inicial e antes do final; remover somente essas quebras estruturais ao extrair a descrição, nunca aplicar `strip()` ao conteúdo.
-- [ ] Normalizar apenas CRLF/CR para LF na comparação do conteúdo textual.
-- [ ] Gerar seção de referência claramente rotulada como somente leitura.
-- [ ] Exibir labels por nome/cor/ID e informar que associação é editada em `content.label_ids`.
-- [ ] Preservar JSON completo dos recursos importados na referência, além das visualizações legíveis; não transformar o JSON inteiro em payload de atualização.
-- [ ] Não alterar descrição legítima por conter palavras como `todo`, `done`, instruções para agentes ou delimitadores de Markdown.
-- [ ] Detectar edição na região somente leitura pelo hash e preservar o documento inteiro em conflito de formato; não enviar essa edição ao Trello nem apagá-la durante refresh.
-- [ ] Ignorar alterações de formatação do próprio JSON que não alterem os valores; não usar o hash dos bytes do arquivo como hash semântico de sincronização.
-- [ ] Regravar metadados técnicos somente por necessidade real: conteúdo mudou, operação ficou pendente ou conflito foi registrado.
+The `PLAN/_modelo-card.md` file uses the same layout, but has `role: template`, no remote identity and is ignored by card scanning. A copy that keeps this role and receives a `todo-`/`done-` name represents an explicit creation intent. A valid TXT processed by `--import` is rendered as the same kind of template, with source metadata for idempotency. The script validates either intent, performs one remote creation, converts the file to `role: card` only after receiving a valid ID and keeps the base template intact.
 
-#### 3.4. Checklists editáveis com identidade estável
+- [x] Generate the visual title from `content.title`, escaping Markdown/HTML for safe representation.
+- [x] Allow changing the title by editing the first Markdown `#` heading; the parser must update `content.title` from that heading.
+- [x] Preserve the description as raw Markdown between its delimiters, including images, lists, tables, code blocks, trailing spaces and blank lines.
+- [x] Define a structural line break after the opening marker and before the closing marker; remove only those structural breaks when extracting the description, never call `strip()` on the content.
+- [x] Normalize only CRLF/CR to LF when comparing textual content.
+- [x] Display the due date, comment count, card link and comments in readable sections clearly labeled read-only.
+- [x] Automatically reformat legacy documents on the first cycle without remote changes and without Trello mutations.
+- [ ] Display labels by name/color/ID and explain that association is edited in `content.label_ids`.
+- [x] Preserve complete JSON for imported resources in the reference, in addition to readable views; do not turn the entire JSON into an update payload.
+- [x] Do not alter a legitimate description because it contains words such as `todo`, `done`, agent instructions or Markdown delimiters.
+- [x] Detect edits in the read-only region through its hash and preserve the entire document in a format conflict; do not send that edit to Trello or erase it during refresh.
+- [x] Ignore formatting changes to the JSON itself when values are unchanged; do not use the file-byte hash as the semantic synchronization hash.
+- [x] Rewrite technical metadata only when truly needed: content changed, an operation is pending or a conflict was recorded.
+- [x] Separate the reserved template from active cards and process only explicit template copies as new creations.
 
-Formato v1 dentro da região de checklists:
+#### 3.4. Editable checklists with stable identity
+
+v1 format inside the checklist region:
 
 ```markdown
-### "Entrega inicial" <!-- syncassist:checklist=000000000000000000000010 -->
-- [ ] "Implementar validação" <!-- syncassist:item=000000000000000000000011 -->
-- [x] "Revisar autenticação" <!-- syncassist:item=000000000000000000000012 -->
+### Entrega inicial <!-- syncassist:checklist=000000000000000000000010 -->
+- [ ] Implement validation <!-- syncassist:item=000000000000000000000011 -->
+- [x] Review authentication <!-- syncassist:item=000000000000000000000012 -->
 
-### "Testes adicionais" <!-- syncassist:checklist=new:testes -->
-- [ ] "Cobrir timeout" <!-- syncassist:item=new:timeout -->
+### Additional tests <!-- syncassist:checklist=new:tests -->
+- [ ] Cobrir timeout <!-- syncassist:item=new:timeout -->
 ```
 
-Os IDs acima são fictícios. O texto entre aspas é uma string JSON em uma linha: isso permite representar aspas, quebras de linha e caracteres especiais sem inferir onde um nome termina. Os nomes continuam completos; somente a representação usa escapes quando necessário.
+The IDs above are fictional. Names are displayed as plain Markdown text for human readability; HTML characters are escaped during rendering, and reading continues to accept the quoted JSON format produced by earlier versions.
 
-- [ ] Representar cada checklist por cabeçalho com nome em string JSON e marcador de ID.
-- [ ] Representar cada item por checkbox, nome em string JSON e marcador de ID.
-- [ ] Interpretar `[ ]` como `incomplete`; `[x]` e `[X]` como `complete`.
-- [ ] Aceitar múltiplas checklists e itens com textos iguais quando seus IDs forem distintos.
-- [ ] Manter IDs existentes quando o nome mudar; nunca excluir e recriar um objeto apenas para renomeá-lo.
-- [ ] Validar que cada checklist existente pertence ao card e cada item existe no conjunto de checklists desse card.
-- [ ] Usar a ordem do documento como ordem pretendida das checklists e itens, ignorando os números absolutos de posição na comparação semântica.
-- [ ] Permitir mover um item existente entre checklists do mesmo card, preservando seu ID e usando os campos permitidos pela API.
-- [ ] Para objetos novos, exigir ID temporário explícito `new:<chave>`, com chave de 1 a 64 caracteres entre letras ASCII minúsculas, números e hífen.
-- [ ] Exigir unicidade das chaves temporárias dentro do documento.
-- [ ] Criar objetos remotos e substituir IDs temporários pelos IDs retornados somente com confirmação registrada.
-- [ ] Rejeitar novos itens sem marcador; não tentar identificá-los por correspondência aproximada de título.
-- [ ] Excluir objeto existente somente com marcador explícito `delete` dentro do comentário, por exemplo `<!-- syncassist:item=<id> delete -->`.
-- [ ] Exigir marcador `delete` no cabeçalho para remover uma checklist inteira; essa operação remove seus itens e deve constar do relatório.
-- [ ] Tratar ausência inexplicada de ID que existia na base como erro de edição, não como autorização implícita de exclusão.
-- [ ] Aceitar ausência local de objeto que também foi removido remotamente e que não tenha outras alterações locais; isso permite convergência legítima.
-- [ ] Rejeitar `delete` em objeto novo e duplicidade de IDs existentes.
-- [ ] Comparar a intenção de exclusão com a base e com o remoto antes de executá-la; remoção versus edição concorrente é conflito.
-- [ ] Preservar atributos somente leitura de itens, como responsável e prazo, ao alterar nome, estado, checklist ou posição.
+- [x] Represent each checklist with a heading, readable name and ID marker.
+- [x] Represent each item with a checkbox, readable name and ID marker.
+- [x] Interpret `[ ]` as `incomplete`; `[x]` and `[X]` as `complete`.
+- [x] Accept multiple checklists and items with equal text when their IDs differ.
+- [x] Keep existing IDs when a name changes; never delete and recreate an object merely to rename it.
+- [x] Validate that each existing checklist belongs to the card and each item exists in that card's checklist set.
+- [x] Use document order as the intended order of checklists and items, ignoring absolute position numbers in semantic comparison.
+- [x] Allow moving an existing item between checklists on the same card while preserving its ID and using API-permitted fields.
+- [x] For new objects, require an explicit temporary ID `new:<key>`, with a key of 1 to 64 characters consisting of lowercase ASCII letters, numbers and hyphens.
+- [x] Require temporary keys to be unique within the document.
+- [x] Create remote objects and replace temporary IDs with returned IDs only after recorded confirmation.
+- [x] Reject new items without a marker; do not identify them by approximate title matching.
+- [x] Delete an existing object only with an explicit `delete` marker inside the comment, for example `<!-- syncassist:item=<id> delete -->`.
+- [ ] Require a `delete` marker in the heading to remove an entire checklist; this operation removes its items and must appear in the report.
+- [x] Treat an unexplained absence of an ID that existed in the base as an edit error, not implicit deletion authorization.
+- [x] Accept local absence of an object that was also removed remotely and has no other local changes; this allows legitimate convergence.
+- [x] Reject `delete` on a new object and duplicate existing IDs.
+- [x] Compare deletion intent with the base and remote state before executing it; removal versus concurrent editing is a conflict.
+- [x] Preserve read-only item attributes such as assignee and due date when changing name, state, checklist or position.
 
-**Saída verificável do bloco:** round-trip de arquivo preserva texto; duas subtarefas homônimas continuam distinguíveis; remover um marcador não apaga dados remotos.
+**Verifiable output of the block:** file round-trip preserves text; two same-name subtasks remain distinguishable; removing a marker does not delete remote data.
 
-### Bloco 4 — Títulos, slugs e nomes portáteis
+### Block 4 — Titles, slugs and portable names
 
-#### 4.1. Regra básica
+#### 4.1. Basic rule
 
 ```text
-todo-titulo-curto.md
-done-titulo-curto.md
-todo-titulo-curto--a1b2c3.md   # somente quando há colisão
-todo-card--a1b2c3.md           # quando não há texto útil
+todo-short-title.md
+done-short-title.md
+todo-short-title--a1b2c3.md   # only when there is a collision
+todo-card--a1b2c3.md           # when there is no useful text
 ```
 
-- [ ] Preservar integralmente o título original em `content.title`; nunca truncar o título enviado ao Trello por causa do limite do nome do arquivo.
-- [ ] Usar o nome do arquivo somente como apresentação e entrada de status.
-- [ ] Usar normalização Unicode NFKC e minúsculas consistentes para o slug.
-- [ ] Remover caracteres de controle, separadores de caminho e caracteres proibidos: `< > : " / \\ | ? *`.
-- [ ] Manter letras e números Unicode; converter espaços, pontuação e separadores em hífen; colapsar hífens repetidos.
-- [ ] Remover pontos, espaços e hífens das extremidades.
-- [ ] Limitar o slug a 60 caracteres e, adicionalmente, a 180 bytes UTF-8, cortando apenas em fronteira de caractere.
-- [ ] Aplicar o limite antes do prefixo, sufixo de colisão e extensão.
-- [ ] Evitar nomes reservados do Windows, inclusive variantes com extensão e famílias `COM1`–`COM9` e `LPT1`–`LPT9`; usar `card-<slug>` quando houver texto aproveitável.
-- [ ] Validar o caminho final no sistema de destino; erro de tamanho total deve preservar os arquivos e informar a necessidade de encurtar a raiz.
+- [ ] Preserve the original title in full in `content.title`; never truncate the title sent to Trello because of the filename limit.
+- [ ] Use the filename only for presentation and status input.
+- [ ] Use Unicode NFKC normalization and consistent lowercase for the slug.
+- [ ] Remove control characters, path separators and forbidden characters: `< > : " / \\ | ? *`.
+- [ ] Keep Unicode letters and numbers; convert spaces, punctuation and separators to hyphens; collapse repeated hyphens.
+- [ ] Remove leading and trailing periods, spaces and hyphens.
+- [ ] Limit the slug to 60 characters and additionally to 180 UTF-8 bytes, cutting only at a character boundary.
+- [ ] Apply the limit before the prefix, collision suffix and extension.
+- [ ] Avoid Windows reserved names, including extension variants and the `COM1`–`COM9` and `LPT1`–`LPT9` families; use `card-<slug>` when useful text exists.
+- [ ] Validate the final path on the target system; a total-length error must preserve files and report that the root needs shortening.
 
-#### 4.2. Imagens, URLs e títulos sem texto
+#### 4.2. Images, URLs and titles without text
 
-- [ ] Para imagem Markdown simples `![texto alternativo](url)`, aproveitar o texto alternativo quando existir.
-- [ ] Para link Markdown simples `[texto](url)`, aproveitar seu texto, sem consultar a URL.
-- [ ] Remover URLs isoladas, data URIs e tags HTML do texto usado para o slug.
-- [ ] Em títulos mistos, aproveitar o texto restante após retirar as referências de mídia.
-- [ ] Se restarem apenas emojis, símbolos ou espaço, usar `card` mais sufixo do ID.
-- [ ] Não depender de parser Markdown completo; documentar a heurística limitada para sintaxe simples e assegurar fallback seguro para sintaxe não reconhecida.
-- [ ] Marcar essa simplificação no código com comentário `ponytail:` informando que interpretar Markdown aninhado exigirá parser específico se houver necessidade real.
-- [ ] Nunca inferir conclusão pelo texto do título ou pelo tipo da capa.
+- [ ] For a simple Markdown image `![alt text](url)`, use the alt text when present.
+- [ ] For a simple Markdown link `[text](url)`, use its text without querying the URL.
+- [ ] Remove standalone URLs, data URIs and HTML tags from the text used for the slug.
+- [ ] In mixed titles, use the remaining text after removing media references.
+- [ ] If only emojis, symbols or whitespace remain, use `card` plus an ID suffix.
+- [ ] Do not depend on a full Markdown parser; document the limited heuristic for simple syntax and provide a safe fallback for unrecognized syntax.
+- [ ] Mark this simplification in the code with a `ponytail:` comment stating that interpreting nested Markdown will require a dedicated parser if there is a real need.
+- [ ] Never infer completion from title text or cover type.
 
-#### 4.3. Colisões e estabilidade
+#### 4.3. Collisions and stability
 
-- [ ] Calcular colisões sobre slugs normalizados e truncados, comparando também com `casefold()` para compatibilidade entre sistemas.
-- [ ] Considerar a colisão independentemente do prefixo `todo-`/`done-`, para não surgir conflito ao concluir um dos cards.
-- [ ] Em grupo de cards com o mesmo slug, acrescentar sufixo a todos os integrantes do grupo; ordenar pelo ID completo para resultado determinístico.
-- [ ] Usar inicialmente os últimos seis caracteres do ID completo como sufixo.
-- [ ] Se o sufixo ainda colidir, ampliar para 8, 12 e, por último, 24 caracteres até distinguir os IDs.
-- [ ] Considerar todos os arquivos já existentes como nomes ocupados, inclusive arquivos não gerenciados.
-- [ ] Se um nome ocupado não puder ser desambiguado com segurança, bloquear o card e não sobrescrever o arquivo.
-- [ ] Guardar o sufixo escolhido em `filename.suffix` e preservá-lo se um card homônimo desaparecer; não causar renomeações apenas para encurtar um nome já estável.
-- [ ] Recalcular o slug quando o título mudar e resolver novamente as colisões.
-- [ ] Uma renomeação manual que altere somente o slug não altera o título remoto; o próximo sync restaura o nome derivado de `content.title`.
-- [ ] Reconhecer somente os prefixos exatos `todo-` e `done-`; prefixo inválido em arquivo gerenciado gera erro, nunca exclusão ou adivinhação.
-- [ ] Planejar as renomeações de todos os cards antes de aplicá-las para tratar trocas de títulos e colisões cruzadas.
-- [ ] Usar nomes temporários únicos para trocas e mudanças apenas de caixa, mantendo identidade e conteúdo recuperáveis se houver interrupção.
-- [ ] Se dois arquivos ativos tiverem o mesmo `trello_card_id`, bloquear ambos; não escolher pelo mais recente nem apagar um deles.
+- [ ] Calculate collisions over normalized and truncated slugs, also comparing with `casefold()` for cross-system compatibility.
+- [ ] Consider collisions independently of the `todo-`/`done-` prefix so completing one card does not create a conflict.
+- [ ] In a group of cards with the same slug, add a suffix to every group member; sort by full ID for a deterministic result.
+- [ ] Initially use the last six characters of the full ID as the suffix.
+- [ ] If the suffix still collides, expand to 8, 12 and finally 24 characters until the IDs differ.
+- [ ] Treat every existing file as an occupied name, including unmanaged files.
+- [ ] If an occupied name cannot be safely disambiguated, block the card and do not overwrite the file.
+- [ ] Store the selected suffix in `filename.suffix` and preserve it if a same-title card disappears; do not rename merely to shorten an already stable name.
+- [ ] Recalculate the slug when the title changes and resolve collisions again.
+- [ ] A manual rename that changes only the slug does not change the remote title; the next sync restores the name derived from `content.title`.
+- [ ] Recognize only the exact `todo-` and `done-` prefixes; an invalid prefix in a managed file produces an error, never deletion or guessing.
+- [ ] Plan all card renames before applying them to handle title swaps and cross-collisions.
+- [ ] Use unique temporary names for swaps and case-only changes, keeping identity and content recoverable if interrupted.
+- [ ] If two active files have the same `trello_card_id`, block both; do not choose the newest or delete one.
 
-**Saída verificável do bloco:** títulos enormes, imagens, emojis, caracteres proibidos e duplicatas resultam em nomes válidos, sem perda do título original nem sobrescrita.
+**Verifiable output of the block:** huge titles, images, emojis, forbidden characters and duplicates produce valid names without losing the original title or overwriting files.
 
-### Bloco 5 — Projeção canônica, hashes e decisão de sincronização
+### Block 5 — Canonical projection, hashes and synchronization decision
 
-#### 5.1. Modelo comparável
+#### 5.1. Comparable model
 
-A projeção editável usada em `sync.base`, na leitura local e na leitura remota tem os mesmos campos:
+The editable projection used in `sync.base`, local reads and remote reads has the same fields:
 
 ```text
-title: string completa
-description: string Markdown completa, com quebras normalizadas para LF
+title: complete string
+description: complete Markdown string, with line breaks normalized to LF
 status: "todo" | "done"
-label_ids: array ordenado de IDs únicos, excluindo a label de conclusão
-checklists: array em ordem visual
-  id: ID estável ou ID temporário de objeto novo local
-  name: nome completo
-  items: array em ordem visual
-    id: ID estável ou ID temporário de objeto novo local
-    name: nome completo
+label_ids: sorted array of unique IDs for all associated labels
+checklists: array in visual order
+  id: stable ID or temporary ID for a new local object
+  name: complete name
+  items: array in visual order
+    id: stable ID or temporary ID for a new local object
+    name: complete name
     state: "incomplete" | "complete"
 ```
 
-- [ ] Canonicalizar o JSON com chaves ordenadas, separadores fixos e UTF-8; calcular SHA-256 do resultado.
-- [ ] Normalizar labels como conjunto de IDs e ordenar apenas esse conjunto.
-- [ ] Preservar ordem de checklists e itens, usando posição remota e ID como desempate de leitura.
-- [ ] Excluir `last_synced_at`, datas de consulta, nomes de arquivo, posição numérica absoluta, nome da lista e metadados somente leitura do hash editável.
-- [ ] Não usar `dateLastActivity` como substituto de comparação de conteúdo.
-- [ ] Materializar marcadores de exclusão como intenção separada validada; a projeção desejada omite o objeto após validar a autorização de remoção.
-- [ ] Reconhecer que IDs temporários mudam após criação; atualizar a projeção desejada com os IDs confirmados antes da comparação final.
-- [ ] Gerar `sync.base` exclusivamente de um estado remoto confirmado compatível com o resultado local.
+- [x] Canonicalize JSON with sorted keys, fixed separators and UTF-8; calculate SHA-256 of the result.
+- [x] Normalize labels as a set of IDs and sort only that set.
+- [x] Preserve checklist and item order, using remote position and ID as the read-time tiebreaker.
+- [x] Exclude `last_synced_at`, query dates, filenames, absolute numeric position, list name and read-only metadata from the editable hash.
+- [x] Do not use `dateLastActivity` as a substitute for content comparison.
+- [x] Materialize deletion markers as a separately validated intent; the desired projection omits the object after removal authorization is validated.
+- [x] Recognize that temporary IDs change after creation; update the desired projection with confirmed IDs before the final comparison.
+- [x] Generate `sync.base` exclusively from a confirmed remote state compatible with the local result.
 
-#### 5.2. Tabela de decisão
+#### 5.2. Decision table
 
-Definições: `B` é a base confirmada; `L`, a projeção local; `R`, a projeção remota atual. Comparações abaixo são semânticas, não por mtime.
+Definitions: `B` is the confirmed base; `L` is the local projection; `R` is the current remote projection. The comparisons below are semantic, not based on mtime.
 
-| Condição | Ação |
+| Condition | Action |
 | --- | --- |
-| Card remoto sem arquivo local | Importar; não criar card remoto. |
-| `L = B` e `R = B` | Nenhuma mutação editável; atualizar referência apenas se ela realmente mudou. |
-| `L = B` e `R ≠ B` | Aplicar versão remota no arquivo. |
-| `L ≠ B` e `R = B` | Validar e enviar somente as alterações locais permitidas. |
-| `L = R`, mesmo que ambos difiram de `B` | Reconhecer convergência; atualizar base sem POST/PUT desnecessário. |
-| `L ≠ B`, `R ≠ B` e `L ≠ R` | Conflito; preservar ambas as versões e bloquear envio daquele card. |
-| Base ausente/corrompida em arquivo gerenciado | Erro de integridade; não assumir que local ou remoto vence. |
-| Referência remota mudou, projeção editável não | Atualizar somente leitura sem conflito editável. |
-| Referência local foi editada | Conflito de formato/somente leitura; preservar bytes e solicitar correção. |
+| Remote card without a local file | Import; do not create a remote card. |
+| `L = B` and `R = B` | No editable mutation; update the reference only if it actually changed. |
+| `L = B` and `R ≠ B` | Apply the remote version to the file. |
+| `L ≠ B` and `R = B` | Validate and send only permitted local changes. |
+| `L = R`, even when both differ from `B` | Recognize convergence; update the base without an unnecessary POST/PUT. |
+| `L ≠ B`, `R ≠ B` and `L ≠ R` | Conflict; preserve both versions and block sending that card. |
+| Missing/corrupted base in a managed file | Integrity error; do not assume local or remote wins. |
+| Remote reference changed, editable projection did not | Update read-only data without an editable conflict. |
+| Local reference was edited | Format/read-only conflict; preserve bytes and request correction. |
 
-- [ ] Implementar a tabela em função pura testável, sem HTTP nem escrita.
-- [ ] Manter conflito no nível do card: alterações diferentes em campos distintos ainda exigem revisão quando ambos os lados divergem.
-- [ ] Não criar conflitos apenas porque chegou comentário, mudou nome de membro ou houve reordenação de uma resposta equivalente da API.
-- [ ] Não considerar mudanças de formatação do JSON uma edição semântica.
-- [ ] Atualizar `last_synced_at` somente quando uma nova base ou referência for efetivamente persistida com sucesso.
-- [ ] Revalidar `R` imediatamente antes de começar mutações remotas. Se mudou desde a decisão, recalcular a classificação.
+- [x] Implement the table as a testable pure function, without HTTP or writes.
+- [x] Keep conflicts at card level: different changes in different fields still require review when both sides diverge.
+- [x] Do not create conflicts merely because a comment arrived, a member name changed or an equivalent API response was reordered.
+- [x] Do not treat JSON formatting changes as a semantic edit.
+- [x] Update `last_synced_at` only when a new base or reference has actually been persisted successfully.
+- [x] Revalidate `R` immediately before starting remote mutations. If it changed since the decision, classify again.
 
-**Saída verificável do bloco:** todos os ramos da tabela são reproduzíveis sem rede e convergência não gera conflito desnecessário.
+**Verifiable output of the block:** every table branch is reproducible without a network and convergence does not create an unnecessary conflict.
 
-### Bloco 6 — Escrita remota, labels e conclusão
+### Block 6 — Remote writes, labels and completion
 
 #### 6.1. Status
 
-- [ ] Derivar status remoto exclusivamente da associação de `TRELLO_DONE_LABEL_ID`.
-- [ ] Derivar status local exclusivamente do prefixo do arquivo principal.
-- [ ] Para transição local a `done-`, associar a label de conclusão se ainda não estiver presente.
-- [ ] Para transição local a `todo-`, remover somente essa associação se estiver presente.
-- [ ] Refletir mudança remota da label renomeando o prefixo quando não houver conflito.
-- [ ] Nunca alterar `idList`, `closed`, `due`, `dueComplete` ou estado de checklist para representar a conclusão do card.
-- [ ] Explicar no README que o status deste produto usa uma label, não o checkbox nativo de prazo do Trello.
-- [ ] Não inferir conclusão do card a partir de todos os itens de checklist marcados.
-- [ ] Rejeitar inclusão manual da label de conclusão em `content.label_ids`, indicando o uso do prefixo; não manter duas fontes concorrentes de status.
+- [x] Derive remote status exclusively from `card.dueComplete == true`.
+- [x] Derive local status exclusively from the main file prefix.
+- [x] For a local transition to `done-`, send `dueComplete=true`; if the card has no due date, set the current date as the due date in the same update.
+- [x] For a local transition to `todo-`, send only `dueComplete=false` and preserve the existing due date.
+- [x] Reflect a remote `dueComplete` change by renaming the prefix when there is no conflict.
+- [x] Never change `idList`, `closed` or checklist state to represent card completion.
+- [x] Treat labels, including `Done`, only as ordinary associations and never as a status source.
+- [x] Do not infer card completion from all checklist items being checked.
+- [x] Allow `Done` in `content.label_ids` as an ordinary label, without a competing status source.
 
-#### 6.2. Campos e operações permitidas
+#### 6.2. Allowed fields and operations
 
-- [ ] Validar título como string não vazia segundo os limites atuais da API; não truncar para fazê-lo caber.
-- [ ] Aceitar descrição vazia como remoção intencional da descrição, desde que a região esteja estruturalmente íntegra.
-- [ ] Usar uma lista explícita de campos permitidos ao construir cada payload.
-- [ ] Calcular deltas de título/descrição em vez de reenviar o snapshot inteiro.
-- [ ] Validar cada label comum contra o catálogo do quadro; preservar cor e nome globais.
-- [ ] Adicionar/remover somente as associações de labels necessárias ao resultado desejado.
-- [ ] Preservar objetos e IDs de checklist ao editar nomes, estados e ordem.
-- [ ] Aplicar criação de checklist antes de seus itens; resolver IDs temporários pelos retornos confirmados.
-- [ ] Aplicar alterações e movimentos de itens antes de exclusões de checklists que poderiam contê-los.
-- [ ] Executar exclusões explicitamente marcadas por último e registrar contagem separada no relatório.
-- [ ] Não excluir subobjetos por erro de parsing, listagem incompleta ou falha na leitura da base.
-- [ ] Buscar o estado remoto novamente após o lote; só concluir a sincronização quando corresponder à intenção validada, incluindo IDs atribuídos e preservação de campos não editáveis.
+- [ ] Validate the title as a non-empty string under the API's current limits; do not truncate it to fit.
+- [x] Accept an empty description as an intentional description removal when the region is structurally valid.
+- [x] Use an explicit allowlist of permitted fields when building each payload.
+- [x] Calculate title/description deltas instead of resending the full snapshot.
+- [x] Validate each ordinary label against the board catalog; preserve its global color and name.
+- [x] Add/remove only the label associations required by the desired result.
+- [x] Preserve checklist objects and IDs when editing names, states and order.
+- [x] Create a checklist before its items; resolve temporary IDs from confirmed responses.
+- [x] Apply item changes and moves before deleting checklists that could contain them.
+- [ ] Apply explicitly marked deletions last and record a separate count in the report.
+- [x] Do not delete subobjects because of a parsing error, incomplete listing or base-read failure.
+- [x] Fetch remote state again after the batch; complete synchronization only when it matches the validated intent, including assigned IDs and preservation of non-editable fields.
 
-**Saída verificável do bloco:** mudar `todo-` para `done-` altera somente a label definida; edição de checklist não recria IDs existentes nem modifica prazos e membros.
+**Verifiable output of the block:** changing `todo-` to `done-` changes the native `dueComplete` checkbox and sets a due date only when none exists; checklist edits do not recreate existing IDs or modify members.
 
-### Bloco 7 — Falhas parciais, retomada e integridade local
+### Block 7 — Partial failures, resumption and local integrity
 
-#### 7.1. Registro de operações no próprio arquivo
+#### 7.1. Operation record in the file itself
 
-Uma sincronização de card pode exigir diversas chamadas HTTP. Não existe commit único que una Trello e disco. O campo `sync.pending` registra a intenção e o progresso sem criar banco ou arquivo global de estado.
+A card synchronization may require several HTTP calls. There is no single commit joining Trello and disk. The `sync.pending` field records intent and progress without creating a database or global state file.
 
-- [ ] Antes da primeira mutação remota, gravar atomicamente `sync.pending` com ID da execução, base original, fingerprint remoto observado, projeção desejada e operações ordenadas.
-- [ ] Cada operação deverá conter tipo permitido, IDs-alvo, ID temporário quando aplicável, payload mínimo, estado e ID remoto confirmado quando houver criação.
-- [ ] Usar estados `not_sent`, `sent_unconfirmed` e `confirmed`.
-- [ ] Persistir `sent_unconfirmed` antes de enviar a operação; persistir `confirmed` e o retorno relevante depois da resposta validada.
-- [ ] Não avançar `sync.base`, `base_hash` ou `last_synced_at` enquanto o lote inteiro não for confirmado.
-- [ ] Se falhar uma operação, preservar as edições locais, a base anterior e o registro do que já foi confirmado.
-- [ ] Continuar o processamento dos demais cards se a falha não for global.
-- [ ] Na execução seguinte, resolver `pending` antes da tabela normal de sincronização, pois alterações causadas pela própria execução não são novas alterações externas.
-- [ ] Reconstruir o estado remoto esperado a partir da base e das operações confirmadas; continuar apenas se o remoto ainda for compatível com esse progresso.
-- [ ] Confirmar pelo estado remoto operações repetíveis cujo resultado ficou incerto, sem reenviar automaticamente por hábito.
-- [ ] Não repetir POST de criação de checklist ou item em estado `sent_unconfirmed` quando o ID não foi recuperado.
-- [ ] Não tentar descobrir um objeto criado só pelo nome: nomes repetidos são válidos.
-- [ ] Para criação de resultado desconhecido, abrir conflito de operação ambígua e bloquear novas escritas daquele card.
-- [ ] Resolver operação ambígua aceitando explicitamente a versão remota, preservando o documento local como backup; em seguida, o usuário poderá reaplicar somente as intenções ainda ausentes num novo ciclo.
-- [ ] Não permitir que uma decisão genérica `local` repita criações ambíguas; informar esse impedimento no artefato.
-- [ ] Não executar operações arbitrárias lidas do JSON pendente: validar novamente allowlist, escopo, IDs e coerência com as projeções base/desejada.
-- [ ] Se a intenção local mudar enquanto houver operação pendente, preservar ambos os estados e exigir revisão, sem misturar lotes silenciosamente.
-- [ ] Limpar `pending` somente após releitura remota final e persistência local bem-sucedidas.
+- [x] Before the first remote mutation, atomically write `sync.pending` with run ID, original base, observed remote fingerprint, desired projection and ordered operations.
+- [x] Each operation must contain an allowed type, target IDs, a temporary ID when applicable, minimal payload, state and confirmed remote ID when creation occurs.
+- [x] Use states `not_sent`, `sent_unconfirmed` and `confirmed`.
+- [x] Persist `sent_unconfirmed` before sending the operation; persist `confirmed` and the relevant response after validating the response.
+- [x] Do not advance `sync.base`, `base_hash` or `last_synced_at` until the entire batch is confirmed.
+- [x] If an operation fails, preserve local edits, the previous base and the record of what was already confirmed.
+- [x] Continue processing other cards if the failure is not global.
+- [ ] On the next run, resolve `pending` before the normal synchronization table because changes caused by the same run are not new external changes.
+- [ ] Rebuild the expected remote state from the base and confirmed operations; continue only if the remote is still compatible with that progress.
+- [ ] Confirm repeatable operations whose result is uncertain through remote state, without automatically resending them by habit.
+- [x] Do not repeat a checklist or item creation POST in `sent_unconfirmed` state when the ID was not recovered.
+- [x] Do not try to discover a created object by name alone: repeated names are valid.
+- [x] For an unknown creation result, open an ambiguous-operation conflict and block new writes for that card.
+- [x] Resolve an ambiguous operation by explicitly accepting the remote version while preserving the local document as a backup; the user can then reapply only missing intents in a new cycle.
+- [x] Do not allow a generic `local` decision to repeat ambiguous creations; report this restriction in the artifact.
+- [ ] Do not execute arbitrary operations read from pending JSON: revalidate the allowlist, scope, IDs and consistency with the base/desired projections.
+- [ ] If local intent changes while an operation is pending, preserve both states and require review without silently mixing batches.
+- [x] Clear `pending` only after the final remote reread and successful local persistence.
 
-#### 7.2. Escrita atômica e concorrência
+#### 7.2. Atomic writes and concurrency
 
-- [ ] Criar lock exclusivo em `PLAN/.sync.lock` com a operação nativa de criação exclusiva do arquivo.
-- [ ] Gravar PID, identificação da máquina e timestamp no lock para diagnóstico.
-- [ ] Segunda execução deve encerrar com falha operacional antes de modificar cards ou arquivos.
-- [ ] Remover somente o lock criado pela própria execução, em bloco de finalização.
-- [ ] Não apagar lock antigo automaticamente com base apenas em idade/PID; após encerramento anormal, orientar remoção manual depois de verificar que o processo terminou.
-- [ ] Capturar os bytes lidos do arquivo principal e verificar novamente antes de substituí-lo.
-- [ ] Se o conteúdo mudou durante a operação, guardar o resultado/recibo em conflito e preservar a edição externa, mesmo se o Trello já tiver sido atualizado.
-- [ ] Gravar temporário único no mesmo diretório do destino, fazer flush, fechar o arquivo e substituir com `os.replace` apenas quando o destino for o arquivo gerenciado esperado.
-- [ ] Em arquivo novo, garantir que o destino continua livre; não sobrescrever arquivo que surgiu entre planejamento e aplicação.
-- [ ] Reconhecer que lock próprio não impede um editor externo de gravar no último instante; revalidar o mais perto possível da troca e manter recuperação de resultados já enviados.
-- [ ] Na renomeação, preservar um caminho recuperável com o documento completo até que o novo nome esteja confirmado.
-- [ ] Se uma interrupção deixar dois arquivos com o mesmo ID, bloquear ambos para revisão na próxima execução, em vez de escolher por mtime.
-- [ ] Capturar falha por disco cheio, arquivo aberto no Windows, permissão e caminho inválido; preservar o original e não considerar o card sincronizado.
-- [ ] Nunca aplicar limpeza recursiva da pasta como mecanismo de reparo.
+- [x] Create an exclusive lock at `PLAN/.sync.lock` using the native exclusive-file-creation operation.
+- [x] Store the PID, machine identity and timestamp in the lock for diagnostics.
+- [x] The second run must exit with an operational failure before modifying cards or files.
+- [x] Remove only the lock created by the current run, in finalization.
+- [x] Do not automatically delete an old lock based only on age/PID; after an abnormal exit, advise manual removal after verifying that the process ended.
+- [x] Capture the bytes read from the main file and verify them again before replacing it.
+- [ ] If content changed during the operation, store the result/receipt in a conflict and preserve the external edit, even if Trello was already updated.
+- [x] Create one temporary file in the destination directory, flush and close it, and replace with `os.replace` only when the destination is the expected managed file.
+- [x] For a new file, ensure the destination remains free; do not overwrite a file that appeared between planning and application.
+- [x] Recognize that the local lock does not prevent an external editor from writing at the last moment; revalidate as close as possible to the swap and retain recovery for already-sent results.
+- [ ] During renaming, preserve a recoverable path with the complete document until the new name is confirmed.
+- [ ] If an interruption leaves two files with the same ID, block both for review on the next run instead of choosing by mtime.
+- [ ] Handle full-disk, open-file on Windows, permission and invalid-path failures; preserve the original and do not consider the card synchronized.
+- [x] Never use recursive folder cleanup as a repair mechanism.
 
-**Saída verificável do bloco:** interrupção após criar uma checklist não duplica o objeto na retomada; falha de escrita local não faz o script esquecer uma operação remota enviada.
+**Verifiable output of the block:** an interruption after creating a checklist does not duplicate the object on resumption; a local write failure does not make the script forget a sent remote operation.
 
-### Bloco 8 — Conflitos e resolução explícita
+### Block 8 — Conflicts and explicit resolution
 
-#### 8.1. Detecção e armazenamento
+#### 8.1. Detection and storage
 
-- [ ] Manter o arquivo principal com a edição local, inclusive prefixo e título locais.
-- [ ] Não modificar os campos remotos enquanto o card tiver conflito não resolvido.
-- [ ] Criar `PLAN/.conflicts/<card-id>-<conflict-id>.md` com identidade estável da revisão do conflito.
-- [ ] Incluir `role: "conflict"`, tipo de conflito, IDs, data, fingerprint remoto e link do card.
-- [ ] Incluir a base anterior, a projeção local capturada, a remota capturada e lista dos grupos de campos divergentes.
-- [ ] Preservar cópia integral do documento local no artefato para conflitos de parsing/somente leitura e em falhas de persistência após escrita remota.
-- [ ] Escapar corretamente o conteúdo ao embuti-lo no artefato para não confundir seus delimitadores.
-- [ ] Registrar `sync.conflict` no arquivo principal sem alterar sua versão-base.
-- [ ] Reutilizar o conflito existente quando local/remoto não trouxerem uma nova situação; não produzir cópias idênticas a cada execução.
-- [ ] Se o remoto mudar novamente, criar nova revisão do conflito, conservar a anterior e invalidar resolução preparada para o fingerprint antigo.
-- [ ] Se o artefato for apagado e o conflito persistir, recriá-lo; apagar arquivo de conflito nunca equivale a escolher uma versão.
-- [ ] Ignorar `.conflicts/` na descoberta de cards e na regra de remoção por ausência remota.
+- [x] Keep the main file with the local edit, including the local prefix and title.
+- [x] Do not modify remote fields while the card has an unresolved conflict.
+- [x] Create `PLAN/.conflicts/<card-id>-<conflict-id>.md` with stable identity for the conflict revision.
+- [x] Include `role: "conflict"`, conflict type, IDs, date, remote fingerprint and card link.
+- [x] Include the previous base, captured local projection, captured remote projection and the groups of divergent fields.
+- [x] Preserve a complete copy of the local document in the artifact for parsing/read-only conflicts and persistence failures after a remote write.
+- [x] Escape content correctly when embedding it in the artifact so its delimiters are not confused.
+- [x] Record `sync.conflict` in the main file without changing its base version.
+- [x] Reuse an existing conflict when local/remote state brings no new situation; do not produce identical copies on every run.
+- [x] If the remote changes again, create a new conflict revision, retain the previous one and invalidate a resolution prepared for the old fingerprint.
+- [x] If the artifact is deleted while the conflict persists, recreate it; deleting a conflict file never equals choosing a version.
+- [x] Ignore `.conflicts/` during card discovery and the removal rule for missing remote cards.
 
-#### 8.2. Interface de resolução
+#### 8.2. Resolution interface
 
-A decisão fica em `sync.resolution` do arquivo principal, normalmente `null`. Sua estrutura será:
+The decision lives in `sync.resolution` of the main file and is normally `null`. Its structure is:
 
 ```json
 {
-  "conflict_id": "identificador-exato-do-conflito-revisado",
+  "conflict_id": "exact-identifier-of-reviewed-conflict",
   "choice": "local",
-  "expected_remote_hash": "fingerprint-remoto-exato-do-artefato"
+  "expected_remote_hash": "exact-remote-fingerprint-from-artifact"
 }
 ```
 
-As strings descritivas acima são exemplos documentais; a ferramenta deverá produzir os valores reais no artefato para cópia. `choice` aceita somente `local`, `remote` ou `merged`.
+The descriptive strings above are documentation examples; the tool must produce the real values in the artifact for copying. `choice` accepts only `local`, `remote` or `merged`.
 
-- [ ] Para `local`, usar os campos editáveis atuais do arquivo principal e seu prefixo como resultado desejado.
-- [ ] Para `remote`, usar a versão remota revisada; fazer backup do documento local antes de substituí-lo.
-- [ ] Para `merged`, o responsável edita título, descrição, labels, checklists e prefixo no arquivo principal; o script usa esse resultado como uma versão local explicitamente revisada.
-- [ ] Não permitir resolução editando diretamente `sync.base` ou seus hashes.
-- [ ] Reconsultar o remoto antes de aplicar a decisão e comparar seu hash com `expected_remote_hash`.
-- [ ] Recusar `conflict_id` desconhecido, decisão com hash obsoleto ou card cujo binding tenha mudado.
-- [ ] Gerar revisão nova se houve mudança remota; não interpretar uma decisão antiga como autorização permanente.
-- [ ] Para conflito de seção somente leitura, aceitar `remote` com backup ou exigir restaurar a estrutura/seção indevidamente editada; `local` não autoriza enviar campos fora do escopo.
-- [ ] Para criação remota ambígua do Bloco 7, permitir somente aceitação explícita do remoto e revisão posterior da intenção restante.
-- [ ] Depois de aplicar e confirmar o resultado, atualizar base/hashes, limpar `pending`, `conflict` e `resolution` e gerar arquivo canônico.
-- [ ] Manter o artefato resolvido como registro inativo, indicando a decisão e data; não apagá-lo automaticamente.
-- [ ] Se houver conflito em um card, sincronizar os demais e encerrar com código `1`.
+- [x] For `local`, use the main file's current editable fields and prefix as the desired result.
+- [x] For `remote`, use the reviewed remote version; back up the local document before replacing it.
+- [x] For `merged`, the owner edits the title, description, labels, checklists and prefix in the main file; the script uses that result as an explicitly reviewed local version.
+- [x] Do not allow resolution by directly editing `sync.base` or its hashes.
+- [x] Query the remote again before applying the decision and compare its hash with `expected_remote_hash`.
+- [x] Reject an unknown `conflict_id`, a decision with an obsolete hash or a card whose binding changed.
+- [x] Generate a new revision when the remote changed; do not interpret an old decision as permanent authorization.
+- [x] For a read-only section conflict, accept `remote` with a backup or require restoring the improperly edited structure/section; `local` does not authorize sending out-of-scope fields.
+- [x] For the ambiguous remote creation in Block 7, allow only explicit acceptance of the remote and later review of the remaining intent.
+- [x] After applying and confirming the result, update base/hashes, clear `pending`, `conflict` and `resolution`, and generate the canonical file.
+- [ ] Keep the resolved artifact as an inactive record indicating the decision and date; do not delete it automatically.
+- [x] If a card has a conflict, synchronize the others and exit with code `1`.
 
-**Saída verificável do bloco:** excluir o artefato ou repetir uma decisão obsoleta não sobrescreve o Trello; base, local e remoto ficam disponíveis para revisão.
+**Verifiable output of the block:** deleting the artifact or repeating an obsolete decision does not overwrite Trello; base, local and remote versions remain available for review.
 
-### Bloco 9 — Remoção remota, movimentação e recuperação
+### Block 9 — Remote removal, movement and recovery
 
-#### 9.1. Regra de escopo
+#### 9.1. Scope rule
 
-- [ ] Considerar ativo para o projeto todo card cujo `idList` ainda corresponda à configuração, incluindo cards arquivados.
-- [ ] Não usar presença em resposta filtrada de cards abertos como critério de existência.
-- [ ] Para arquivo gerenciado cujo ID não apareceu no inventário completo, consultar individualmente o card antes de retirá-lo.
-- [ ] Se a consulta confirmar outra lista, classificá-lo como movido e não enviar alterações locais a partir do projeto original.
-- [ ] Se a consulta confirmar a mesma lista, preservar o arquivo e tratar a divergência de inventário como erro, nunca como exclusão.
-- [ ] Se retornar 404, registrar ausência/inacessibilidade, não afirmar que houve exclusão definitiva.
-- [ ] Antes de qualquer retirada por 404, confirmar novamente acesso à lista/quadro e obter um segundo inventário completo no mesmo ciclo.
-- [ ] Se o card continuar ausente nesses inventários íntegros, retirar o principal de forma recuperável, com motivo `absent_or_inaccessible`.
-- [ ] Para 401, 403, timeout, 429 esgotado, JSON inválido ou inventário incompleto, preservar o principal e reportar erro; não limpar a coleção.
-- [ ] Se ocorrer falha global depois do inventário inicial, cancelar a fase de remoções, mesmo que alguns cards já tenham sido sincronizados.
-- [ ] Tratar lista validamente vazia como um caso legítimo, sujeito às mesmas confirmações por card.
+- [ ] Consider every card whose `idList` still matches the configuration active for the project, including archived cards.
+- [ ] Do not use presence in a filtered open-card response as an existence criterion.
+- [ ] For a managed file whose ID did not appear in the complete inventory, query the card individually before removing it.
+- [ ] If the query confirms another list, classify it as moved and do not send local changes from the original project.
+- [ ] If the query confirms the same list, preserve the file and treat the inventory discrepancy as an error, never as deletion.
+- [ ] If it returns 404, record absence/inaccessibility without claiming definitive deletion.
+- [ ] Before any removal based on 404, reconfirm list/board access and obtain a second complete inventory in the same cycle.
+- [ ] If the card remains absent in those complete inventories, recoverably remove the main file with reason `absent_or_inaccessible`.
+- [ ] For 401, 403, timeout, exhausted 429, invalid JSON or incomplete inventory, preserve the main file and report the error; do not clean the collection.
+- [ ] If a global failure occurs after the initial inventory, cancel the removal phase even if some cards have already synchronized.
+- [ ] Treat a validly empty list as a legitimate case subject to the same per-card confirmations.
 
-#### 9.2. Retirada recuperável
+#### 9.2. Recoverable removal
 
-- [ ] Criar a pasta `.removed/` apenas quando houver algo a preservar.
-- [ ] Validar caminho absoluto, vínculo de identidade e pertencimento à pasta `PLAN/` antes de mover um arquivo.
-- [ ] Recusar `PLAN/`, arquivos ou subpastas de controle que sejam symlinks/junctions/reparse points apontando para fora do projeto.
-- [ ] Mover o principal para nome único em `.removed/`, composto por ID completo e timestamp UTC com precisão suficiente para evitar sobrescrita.
-- [ ] Preservar os bytes originais do principal, inclusive alterações locais, registros pendentes e metadados antigos.
-- [ ] Registrar o motivo da retirada no relatório e, quando houver conflito/pendência, em artefato de revisão relacionado.
-- [ ] Manter artefatos de conflito já existentes; não apagá-los junto com o card.
-- [ ] Se houver edição local não sincronizada, conflito ou operação pendente, retirar recuperavelmente e retornar `1`, informando que existe trabalho a revisar.
-- [ ] Quando não houver edição pendente e a mudança de lista estiver confirmada, considerar a retirada normal e bem-sucedida.
-- [ ] Para ausência/inacessibilidade não distinguível de exclusão, manter aviso e saída `1`, mesmo após retirar recuperavelmente.
-- [ ] Não purgar `.removed/` automaticamente nem implementar retenção temporal no MVP.
-- [ ] Informar a localização do backup e a possibilidade de recuperação no resumo da operação.
+- [ ] Create `.removed/` only when there is something to preserve.
+- [ ] Validate the absolute path, identity binding and membership in `PLAN/` before moving a file.
+- [ ] Reject `PLAN/`, files or control subfolders that are symlinks/junctions/reparse points pointing outside the project.
+- [ ] Move the main file to a unique name in `.removed/`, composed of the full ID and a UTC timestamp precise enough to prevent overwrites.
+- [ ] Preserve the main file's original bytes, including local changes, pending records and old metadata.
+- [ ] Record the removal reason in the report and, when there is a conflict/pending work, in a related review artifact.
+- [ ] Keep existing conflict artifacts; do not delete them with the card.
+- [ ] If there is an unsynchronized local edit, conflict or pending operation, remove recoverably and return `1`, reporting that work requires review.
+- [ ] When no pending edit exists and the list change is confirmed, consider the removal normal and successful.
+- [ ] For absence/inaccessibility that cannot be distinguished from deletion, keep a warning and return `1` even after recoverable removal.
+- [ ] Do not automatically purge `.removed/` or implement time-based retention in the MVP.
+- [ ] Report the backup location and recovery possibility in the operation summary.
 
-O requisito de exclusão remota é atendido retirando o arquivo da raiz ativa de `PLAN/`. A cópia em `.removed/` evita perda irreversível em casos de indisponibilidade de identidade ou trabalho local pendente; não participa de futuras comparações de cards.
+The remote-deletion requirement is met by removing the file from the active `PLAN/` root. The copy in `.removed/` prevents irreversible loss when identity is unavailable or local work is pending; it does not participate in future card comparisons.
 
-#### 9.3. Arquivo local apagado e card que retorna
+#### 9.3. Locally deleted file and returning card
 
-- [ ] Quando um card existir no escopo e não houver arquivo principal, importar seu estado remoto atual.
-- [ ] Não enviar exclusão, arquivamento ou movimento ao Trello por ausência local.
-- [ ] Não restaurar automaticamente alterações antigas de `.removed/`; preservar o backup para revisão separada.
-- [ ] Se o card voltar à lista, criar um novo principal a partir do remoto atual, mantendo backups anteriores.
-- [ ] Informar criação local; sem estado global, nem sempre é possível distinguir primeira importação de recriação após exclusão manual.
-- [ ] Não inventar essa distinção nas métricas: agrupar como `arquivos criados/recriados`.
-- [ ] Ignorar Markdown local não gerenciado, mesmo que seu nome comece com `todo-` ou `done-`.
-- [ ] Nunca sobrescrever arquivo não gerenciado para acomodar um nome gerado; resolver colisão ou reportar erro.
+- [ ] When a card exists in scope and has no main file, import its current remote state.
+- [ ] Do not send deletion, archiving or movement to Trello because of local absence.
+- [ ] Do not automatically restore old changes from `.removed/`; preserve the backup for separate review.
+- [ ] If the card returns to the list, create a new main file from the current remote state while retaining previous backups.
+- [ ] Report local creation; without global state, it is not always possible to distinguish first import from recreation after manual deletion.
+- [ ] Do not invent this distinction in metrics: group both as `files created/recreated`.
+- [ ] Ignore unmanaged local Markdown even if its name starts with `todo-` or `done-`.
+- [ ] Never overwrite an unmanaged file to accommodate a generated name; resolve the collision or report an error.
 
-**Saída verificável do bloco:** card movido sai da pasta ativa, arquivo local apagado reaparece, falha de rede não apaga planos e arquivos pessoais permanecem intactos.
+**Verifiable output of the block:** a moved card leaves the active folder, a locally deleted file reappears, a network failure does not delete plans and personal files remain intact.
 
-### Bloco 10 — Orquestração e interface de execução
+### Block 10 — Orchestration and execution interface
 
-#### 10.1. Sequência completa
+#### 10.1. Complete sequence
 
-- [ ] Interpretar CLI; `--help` e `--version` não devem exigir `.env` nem rede.
-- [ ] Validar configuração, binding e acesso remoto.
-- [ ] Criar `PLAN/` se necessário e adquirir lock exclusivo.
-- [ ] Descobrir somente os arquivos da raiz imediata de `PLAN/`; não percorrer subpastas de backup/conflito.
-- [ ] Validar metadados locais, identificar duplicatas e binding divergente antes das mutações.
-- [ ] Se a varredura local estiver incompleta ou corrompida, desabilitar limpeza; processar somente cards com identidade inequívoca.
-- [ ] Obter inventário remoto completo e recursos do card necessário à comparação.
-- [ ] Resolver primeiro operações pendentes e decisões de conflito válidas.
-- [ ] Classificar demais cards pela tabela de três versões.
-- [ ] Planejar nomes finais globalmente com os dados já validados, levando em conta arquivos ocupados e cards bloqueados.
-- [ ] Aplicar importações, atualizações, confirmações e renomeações seguras; preservar nome local de card em conflito até resolvê-lo.
-- [ ] Realizar fase de retirada de ausentes somente depois das verificações de inventário e acesso.
-- [ ] Persistir resultados confirmados e consolidar falhas sem apagar informações parciais.
-- [ ] Liberar o lock próprio em finalização e retornar o código adequado.
+- [ ] Parse the CLI; `--help` and `--version` must not require `.env` or a network.
+- [ ] Validate configuration, binding and remote access.
+- [ ] Create `PLAN/` if necessary and acquire the exclusive lock.
+- [ ] Discover only files in the immediate `PLAN/` root; do not traverse backup/conflict subfolders.
+- [x] Ensure the reserved template exists before scanning; ignore the template itself and separate `role: template` copies from cards with remote identity.
+- [x] Create new cards only from valid template copies or `--import`-generated templates in the configured list and convert them to identified documents after confirmation.
+- [ ] Validate local metadata and identify duplicates and divergent bindings before mutations.
+- [ ] If local scanning is incomplete or corrupted, disable cleanup; process only cards with unambiguous identity.
+- [ ] Obtain the complete remote inventory and the card resources needed for comparison.
+- [ ] Resolve pending operations and valid conflict decisions first.
+- [ ] Classify remaining cards using the three-version table.
+- [ ] Plan final names globally from validated data, accounting for occupied files and blocked cards.
+- [ ] Apply safe imports, updates, confirmations and renames; preserve the local card name while a conflict is unresolved.
+- [ ] Perform missing-card removal only after inventory and access checks.
+- [ ] Persist confirmed results and consolidate failures without deleting partial information.
+- [ ] Release the local lock during finalization and return the appropriate code.
 
-#### 10.2. CLI e versão
+#### 10.2. CLI and version
 
 ```text
 python sync.py
 python sync.py --help
 python sync.py --version
+python sync.py --import
 ```
 
-- [ ] Implementar CLI com `argparse`; a execução sem parâmetros realiza a sincronização automática.
-- [ ] Não abrir navegador nem pedir credenciais interativamente.
-- [ ] Definir versão inicial do produto como `0.1.0` e `schema_version` do documento como `1`; não confundir as duas versões.
-- [ ] Não adicionar opções especulativas de daemon, múltiplas listas, force, prune, reset ou overwrite.
-- [ ] Manter resolução de conflitos no arquivo, sem depender de interação no terminal.
+- [ ] Implement the CLI with `argparse`; execution without parameters performs automatic synchronization.
+- [ ] Do not open a browser or request credentials interactively.
+- [x] Set the product version to `1.0.0` and keep the document `schema_version` at `1`; do not confuse the two versions.
+- [x] Keep `--setup` and `--import` mutually exclusive; `--import` prepares immediate `PLAN/*.txt` files and then executes one normal synchronization.
+- [x] Use the complete TXT content as the description, the normalized first 60 characters as the title and move confirmed sources to `PLAN/.imported/`.
+- [x] Preserve source files after invalid input, collisions, write failures or unconfirmed card creation; continue independent imports and report a non-zero result when intervention is required.
+- [ ] Do not add speculative daemon, multiple-list, force, prune, reset or overwrite options.
+- [ ] Keep conflict resolution in the file without depending on terminal interaction.
 
-#### 10.3. Logs e códigos de saída
+#### 10.3. Logs and exit codes
 
-| Código | Significado |
+| Code | Meaning |
 | --- | --- |
-| `0` | Todos os cards processados com sucesso, inclusive execução sem mudanças. |
-| `1` | Conflito, falha parcial, coleta incompleta, lock, erro de disco ou recuperação/intervenção necessária. |
-| `2` | Uso ou configuração inválida, binding divergente ou versão de schema global incompatível. |
-| `3` | Falha global de autenticação ou permissão de acesso ao quadro/lista. |
+| `0` | All cards processed successfully, including a run with no changes. |
+| `1` | Conflict, partial failure, incomplete collection, lock, disk error or recovery/intervention required. |
+| `2` | Invalid usage or configuration, divergent binding or incompatible global schema version. |
+| `3` | Global authentication or permission failure when accessing the board/list. |
 
-- [ ] Dar prioridade a falha global de autenticação caso aconteça depois de mudanças parciais; informar que o lote não foi concluído.
-- [ ] Listar contagens de cards examinados, arquivos criados/recriados, atualizados, renomeados, retirados, cards enviados, sem mudança, conflitos e falhas.
-- [ ] Diferenciar número de cards de número de operações; um card pode gerar atualização e renomeação.
-- [ ] Registrar operações destrutivas de subitens e o caminho de recuperação de arquivos retirados.
-- [ ] Usar mensagens previsíveis com ação, ID do card e erro resumido.
-- [ ] Não despejar título completo, comentários, descrição, JSON remoto, credenciais, headers ou URL autenticada.
-- [ ] Usar stdout para resumo e stderr para erros; não criar arquivos permanentes de log no MVP.
-- [ ] Se nenhum arquivo/card mudar, informar claramente a ausência de alterações e retornar `0`.
+- [ ] Prioritize a global authentication failure if it occurs after partial changes; report that the batch was not completed.
+- [ ] List counts of examined cards, created/recreated, updated, renamed and removed files, pushed cards, unchanged cards, conflicts and failures.
+- [ ] Distinguish the number of cards from the number of operations; one card can produce an update and a rename.
+- [ ] Record destructive sub-item operations and the recovery path for removed files.
+- [ ] Use predictable messages with an action, card ID and summarized error.
+- [ ] Do not dump the full title, comments, description, remote JSON, credentials, headers or authenticated URL.
+- [ ] Use stdout for summaries and stderr for errors; do not create permanent log files in the MVP.
+- [ ] If no file/card changes, clearly report no changes and return `0`.
 
-**Saída verificável do bloco:** humanos e agentes conseguem executar o mesmo comando, interpretar pendências e repetir uma execução sem provocar mudanças artificiais.
+**Verifiable output of the block:** humans and agents can run the same command, interpret pending work and repeat a run without causing artificial changes.
 
-### Bloco 11 — Segurança e privacidade na distribuição
+### Block 11 — Security and privacy in distribution
 
-- [ ] Criar `.env.example` somente com chaves vazias e explicações não sensíveis.
-- [ ] Mesclar regras à `.gitignore` existente, preservando regras do projeto.
-- [ ] Incluir no modelo de distribuição `.env`, `__pycache__/` e `PLAN/`; não confundir `PLAN/` com este `PLAN.md`.
-- [ ] Documentar que o usuário pode optar por versionar os cards, mas isso publica o conteúdo conforme a visibilidade do repositório e exige excluir backups/conflitos se não quiser versioná-los.
-- [ ] Não tentar remover do índice ou reescrever histórico de arquivos privados já versionados; informar a situação ao responsável.
-- [ ] Orientar token com leitura e escrita, pois o produto é bidirecional; não solicitar permissões extras sem necessidade.
-- [ ] Explicar que restringir `TRELLO_LIST_ID` limita o comportamento do script, mas não necessariamente o alcance do token na conta.
-- [ ] Orientar revogação do token se exposto e uso de lista de teste para a primeira validação de escrita.
-- [ ] Não solicitar que o usuário cole credenciais no chat nem incluí-las em exemplos, fixtures ou mensagens de falha.
-- [ ] Tratar todo texto remoto e todo ID do Markdown como entrada não confiável para construção de paths e requests.
-- [ ] Validar links para exibição; não visitar links de anexos, não baixar recursos e não anexar credenciais a eles.
-- [ ] Escapar HTML em visualizações geradas de comentários/títulos; preservar o original como dado no snapshot.
-- [ ] Não executar conteúdo de `.env`, Markdown, comentários, checklist ou dados compartilhados de Power-Ups.
-- [ ] Documentar para agentes consumidores que instruções de um card não substituem as regras do projeto nem concedem autorização para comandos externos.
+- [ ] Create `.env.example` with empty keys and non-sensitive explanations only.
+- [ ] Merge rules into the existing `.gitignore` while preserving project rules.
+- [ ] Include `.env`, `__pycache__/` and `PLAN/` in the distribution template; do not confuse `PLAN/` with this `PLAN.md`.
+- [ ] Document that users may choose to version cards, but this publishes their contents according to repository visibility and requires excluding backups/conflicts if they should not be versioned.
+- [ ] Do not try to remove already-versioned private files from the index or rewrite history; inform the owner of the situation.
+- [ ] Recommend a token with read and write access because the product is bidirectional; do not request unnecessary permissions.
+- [ ] Explain that restricting `TRELLO_LIST_ID` limits the script's behavior but not necessarily the token's account-wide reach.
+- [ ] Recommend revoking an exposed token and using a test list for the first write validation.
+- [ ] Do not ask users to paste credentials into chat or include them in examples, fixtures or failure messages.
+- [ ] Treat all remote text and every Markdown ID as untrusted input when building paths and requests.
+- [ ] Validate links for display; do not visit attachment links, download resources or attach credentials to them.
+- [ ] Escape HTML in generated comment/title views; preserve the original as snapshot data.
+- [ ] Do not execute content from `.env`, Markdown, comments, checklists or shared Power-Up data.
+- [ ] Document for consuming agents that card instructions do not replace project rules or grant authorization for external commands.
 
-**Saída verificável do bloco:** um token colocado em qualquer erro simulado não aparece nos logs; um título malicioso não produz escrita fora da pasta autorizada.
+**Verifiable output of the block:** a token placed in any simulated error does not appear in logs; a malicious title does not write outside the authorized folder.
 
-### Bloco 12 — Documentação e entrega ao responsável
+### Block 12 — Documentation and handoff to the owner
 
-- [ ] Criar README em português com objetivo, requisitos e instalação por cópia.
-- [ ] Documentar a obtenção de key/token conforme a fonte oficial, sem automatizar autorização no navegador.
-- [ ] Documentar como identificar lista e label por seus IDs completos.
-- [ ] Explicar a decisão da label de conclusão e a diferença em relação ao prazo concluído/arquivamento do Trello.
-- [ ] Documentar cada campo editável e cada região somente leitura do Markdown.
-- [ ] Incluir um exemplo completo e parseável de card produzido pelo script, com dados fictícios e hashes calculados pelo próprio teste.
-- [ ] Incluir exemplos de alteração de título, descrição, label comum, checkbox, criação de checklist/item e exclusão explícita com `delete`.
-- [ ] Explicar que retirar uma linha de checklist sem marcador de exclusão gera erro e como corrigir.
-- [ ] Demonstrar conclusão/reabertura renomeando `todo-` e `done-`.
-- [ ] Demonstrar colisões de títulos, nomes sem texto e truncamento somente do slug.
-- [ ] Documentar resolução `local`, `remote` e `merged`, incluindo rejeição de hash remoto obsoleto.
-- [ ] Explicar operação POST ambígua, backup de documento e reaplicação manual de intenções depois de aceitar o remoto.
-- [ ] Explicar restauração de `.removed/`, lock deixado por encerramento anormal e IDs duplicados após falha de renomeação.
-- [ ] Explicar a distinção entre erro de rede, card ausente, card movido e card arquivado.
-- [ ] Documentar códigos de saída e métricas.
-- [ ] Documentar limites: histórico depende da API/permissões, sem download de anexos, sem transação entre HTTP e disco, sem merge automático.
-- [ ] Incluir instruções para rodar testes offline e a validação manual em lista de teste.
-- [ ] Atualizar README quando uma funcionalidade pública mudar, conforme a regra do projeto.
-- [ ] Não criar CHANGELOG apenas por hábito; se houver alteração/criação de `CHANGELOG.md`, manter versão SemVer consistente: major para quebra, minor para funcionalidade, patch para correção.
-- [ ] Não marcar itens como concluídos apenas porque foram documentados; implementação e validação são necessárias.
-- [ ] Ao entregar, informar arquivos alterados, testes realizados, limitações reais e qualquer item ainda pendente.
+- [ ] Create the README in English with objective, requirements and copy-based installation.
+- [ ] Document obtaining the key/token according to the official source without automating browser authorization.
+- [ ] Document how to identify a list and label by their full IDs.
+- [x] Explain that completion uses the native `dueComplete` checkbox while labels and archiving are independent.
+- [ ] Document every editable field and every read-only Markdown region.
+- [ ] Include a complete, parseable example of a card produced by the script with fictional data and hashes calculated by the test itself.
+- [ ] Include examples of changing the title, description, ordinary label and checkbox, creating a checklist/item and explicitly deleting with `delete`.
+- [ ] Explain that removing a checklist line without a deletion marker produces an error and how to fix it.
+- [ ] Demonstrate completion/reopening by renaming `todo-` and `done-`.
+- [ ] Demonstrate title collisions, names without text and truncation of the slug only.
+- [ ] Document `local`, `remote` and `merged` resolution, including rejection of an obsolete remote hash.
+- [ ] Explain ambiguous POST operations, document backups and manually reapplying intents after accepting the remote version.
+- [ ] Explain restoring `.removed/`, a lock left by an abnormal exit and duplicate IDs after a rename failure.
+- [ ] Explain the distinction between a network error, missing card, moved card and archived card.
+- [ ] Document exit codes and metrics.
+- [ ] Document limits: history depends on API/permissions, no attachment downloads, no transaction between HTTP and disk and no automatic merge.
+- [ ] Include instructions for running offline tests and manual validation on a test list.
+- [ ] Update README when a public feature changes, according to the project rule.
+- [x] Keep `CHANGELOG.md` as a concise project history and use consistent SemVer release headings.
+- [ ] Do not mark items complete merely because they were documented; implementation and validation are required.
+- [ ] At handoff, report changed files, tests run, real limitations and any remaining pending item.
 
-## 5. Critérios de validação e conclusão
+## 5. Validation and completion criteria
 
-### 5.1. Testes automatizados offline
+### 5.1. Automated offline tests
 
-Arquivos-alvo futuros: um único `test_sync.py`, usando `unittest`, `unittest.mock` quando útil e `tempfile`. Manter os testes pequenos e orientados a comportamentos e perda de dados; não exigir rede, credenciais ou framework externo. O transporte poderá ser substituído por uma função fake nos testes, sem criar uma camada de abstração pública apenas para esse fim.
+Future target files: a single `test_sync.py`, using `unittest`, `unittest.mock` when useful and `tempfile`. Keep tests small and focused on behavior and data loss; do not require a network, credentials or an external framework. The transport may be replaced by a fake function in tests without creating a public abstraction layer solely for that purpose.
 
-#### A. Configuração e isolamento
+#### A. Configuration and isolation
 
-- [ ] `.env` com BOM, aspas, `=` no valor, `#` no valor, comentários e variáveis de outro projeto.
-- [ ] Campo obrigatório ausente, aspas incompletas, valor vazio e duplicidade de chave.
-- [ ] Execução de outra pasta resolve a raiz do script corretamente.
-- [ ] Binding de lista/quadro/label divergente preserva os arquivos e não envia requests de escrita.
-- [ ] `--help` e `--version` funcionam sem `.env` e sem rede.
+- [ ] `.env` with BOM, quotes, `=` in a value, `#` in a value, comments and variables from another project.
+- [ ] Missing required field, incomplete quotes, empty value and duplicate key.
+- [ ] Running from another folder resolves the script root correctly.
+- [ ] Divergent list/board/label binding preserves files and sends no write requests.
+- [ ] `--help` and `--version` work without `.env` and without a network.
 
-#### B. Nomes e parsing
+#### B. Names and parsing
 
-- [ ] Título curto normal e título muito longo, preservando o original completo.
-- [ ] Unicode, acentos, emojis, controles, nomes reservados, caracteres de caminho e título em escrita não latina.
-- [ ] Imagem Markdown com/sem texto alternativo, URL pura, título misto e string sem conteúdo útil.
-- [ ] Colisão por truncamento, caixa, normalização Unicode e sufixo curto igual.
-- [ ] Colisão com arquivo não gerenciado, troca de títulos entre dois cards e transição `todo-`/`done-`.
-- [ ] Round-trip de descrição com blocos de código, headings iguais aos da ferramenta, linhas vazias, espaços finais e CRLF.
-- [ ] JSON inválido, versão desconhecida, região duplicada e marcador ausente não geram push nem remoção.
-- [ ] Duas checklists/itens homônimos mantêm identidades separadas.
-- [ ] Item sem ID, ID de outro card, marcador duplicado e exclusão implícita são rejeitados.
-- [ ] Exclusão explícita, criação com ID temporário, renomeação e mudança de ordem mantêm o contrato definido.
+- [ ] Normal short title and very long title, preserving the complete original.
+- [ ] Unicode, accents, emojis, controls, reserved names, path characters and non-Latin writing.
+- [ ] Markdown image with/without alt text, plain URL, mixed title and string without useful content.
+- [ ] Collision caused by truncation, case, Unicode normalization and equal short suffix.
+- [ ] Collision with an unmanaged file, title swap between two cards and `todo-`/`done-` transition.
+- [ ] Description round-trip with code blocks, headings equal to the tool's headings, blank lines, trailing spaces and CRLF.
+- [ ] Invalid JSON, unknown version, duplicate region and missing marker produce neither a push nor a removal.
+- [ ] Two same-name checklists/items keep separate identities.
+- [ ] Item without ID, ID from another card, duplicate marker and implicit deletion are rejected.
+- [ ] Explicit deletion, creation with a temporary ID, renaming and reordering preserve the defined contract.
 
-#### C. Comparação e sincronização
+#### C. Comparison and synchronization
 
-- [ ] Cobrir todos os ramos da tabela `B/L/R`, incluindo ambos alterados com resultado igual.
-- [ ] Alteração apenas em comentário ou dado somente leitura remoto não causa conflito editável.
-- [ ] Edição indevida de referência local é preservada e não enviada.
-- [ ] Título editado no front matter atualiza o card e o nome do arquivo.
-- [ ] Alterar apenas o slug não muda o título remoto.
-- [ ] `done-` adiciona a label correta e `todo-` remove somente essa label.
-- [ ] Nenhuma mudança de status modifica lista, arquivamento, prazo, `dueComplete` ou conclusão das subtarefas.
-- [ ] Arquivo sem alteração não é regravado e não muda seu mtime ou `last_synced_at`.
-- [ ] Segunda execução após sincronização bem-sucedida faz zero escritas HTTP e zero mudanças de arquivo.
+- [ ] Cover every branch of the `B/L/R` table, including both changed with equal results.
+- [ ] A change only in a comment or remote read-only data does not cause an editable conflict.
+- [ ] Improper local reference editing is preserved and not sent.
+- [ ] A title edited in the Markdown heading updates the card and filename.
+- [ ] Changing only the slug does not change the remote title.
+- [x] Each synchronization keeps `PLAN/_modelo-card.md`; a `todo-`/`done-` copy creates a card once and becomes a normal document after confirmation.
+- [x] `done-` sets `dueComplete=true` and `todo-` sets `dueComplete=false` without adding/removing labels.
+- [x] When completing without a due date, set the current date; when reopening, preserve the due date and change only `dueComplete`.
+- [ ] An unchanged file is not rewritten and does not change its mtime or `last_synced_at`.
+- [ ] A second run after successful synchronization performs zero HTTP writes and zero file changes.
 
-#### D. HTTP, completude e falhas
+#### D. HTTP, completeness and failures
 
-- [ ] Respostas 400, 401, 403, 404, 429, 5xx, JSON inválido e timeout são classificadas corretamente.
-- [ ] Paginação com mais de uma página preserva todas as ações; cursor repetido gera erro, não loop infinito.
-- [ ] Resposta incompleta jamais é convertida em lista vazia para limpeza.
-- [ ] Um recurso complementar que falhou preserva o dado anterior e sinaliza coleta incompleta.
-- [ ] Inventário inclui card arquivado ainda na lista.
-- [ ] Falha em um card permite processar outro; falha de autenticação global interrompe próximas mutações.
-- [ ] Backoff respeita limite de tentativas; simular o relógio nos testes para não esperar de verdade.
-- [ ] Token e key sentinelas não aparecem em stdout/stderr, mesmo dentro de mensagem de erro HTTP simulada.
+- [ ] Responses 400, 401, 403, 404, 429, 5xx, invalid JSON and timeout are classified correctly.
+- [ ] Pagination with more than one page preserves all actions; a repeated cursor raises an error instead of looping forever.
+- [ ] An incomplete response is never converted into an empty list for cleanup.
+- [ ] A failed complementary resource preserves previous data and signals an incomplete collection.
+- [ ] The inventory includes an archived card still in the list.
+- [ ] A failure on one card allows another to be processed; a global authentication failure stops subsequent mutations.
+- [ ] Backoff respects the attempt limit; simulate the clock in tests instead of waiting in real time.
+- [ ] Sentinel token and key values do not appear in stdout/stderr, even inside a simulated HTTP error message.
+- [x] Card creation uses `POST /cards` with the configured list, preserves the template and does not write the document as a card before receiving a valid remote ID.
 
-#### E. Recuperação e conflitos
+#### E. Recovery and conflicts
 
-- [ ] Conflito preserva base/local/remoto e bloqueia somente o card correspondente.
-- [ ] Apagar artefato de conflito não autoriza overwrite; conflito é recriado.
-- [ ] Resolução com hash antigo é recusada após nova alteração remota.
-- [ ] Decisões local/remota/mesclada válidas convergem e limpam o estado de pendência.
-- [ ] Crash antes do POST, após envio sem resposta e após resposta antes da gravação não causam criação duplicada automática.
-- [ ] Falha na segunda operação preserva a primeira confirmada e a intenção restante.
-- [ ] Aceitar remoto em POST ambíguo importa o estado real sem reenviar a criação.
-- [ ] Edição local durante HTTP não é sobrescrita na persistência final.
-- [ ] Disco cheio ou erro de substituição preserva original e pendência remota.
-- [ ] Lock impede segunda execução; remoção de lock alheio não acontece automaticamente.
+- [ ] A conflict preserves base/local/remote and blocks only the corresponding card.
+- [ ] Deleting a conflict artifact does not authorize an overwrite; the conflict is recreated.
+- [ ] A resolution with an old hash is rejected after a new remote change.
+- [ ] Valid local/remote/merged decisions converge and clear pending state.
+- [ ] A crash before POST, after sending without a response and after a response before writing does not cause automatic duplicate creation.
+- [ ] A failure in the second operation preserves the first confirmed operation and the remaining intent.
+- [ ] Accepting the remote result of an ambiguous POST imports the actual state without resending creation.
+- [ ] A local edit during HTTP is not overwritten during final persistence.
+- [ ] A full disk or replacement error preserves the original and remote pending state.
+- [ ] The lock prevents a second run; an unrelated lock is not removed automatically.
 
-#### F. Remoções e arquivos pessoais
+#### F. Removals and personal files
 
-- [ ] Card movido é retirado do conjunto ativo e tem backup recuperável.
-- [ ] Card ausente com dois inventários íntegros e 404 é retirado recuperavelmente com diagnóstico de ambiguidade.
-- [ ] 404 isolado, 403, timeout ou inventário incompleto não removem arquivo.
-- [ ] Card arquivado na mesma lista permanece representado e não vira `done-` por arquivamento.
-- [ ] Arquivo apagado localmente é recriado e nenhum DELETE de card é enviado.
-- [ ] Retirada de arquivo com edição pendente preserva seu conteúdo e reporta revisão necessária.
-- [ ] Markdown pessoal, symlink/junction inseguro, backup e artefato de conflito não são tratados como cards ativos.
-- [ ] Card que retorna à lista recebe principal novo do remoto, sem aplicar automaticamente backup antigo.
+- [ ] A moved card is removed from the active set and has a recoverable backup.
+- [ ] A missing card with two complete inventories and a 404 is recoverably removed with an ambiguity diagnosis.
+- [ ] An isolated 404, 403, timeout or incomplete inventory does not remove a file.
+- [ ] A card archived in the same list remains represented and does not become `done-` because of archiving.
+- [ ] A locally deleted file is recreated and no card DELETE is sent.
+- [ ] Removing a file with pending edits preserves its content and reports that review is required.
+- [ ] Personal Markdown, unsafe symlink/junction, backup and conflict artifacts are not treated as active cards.
+- [ ] A card returning to the list receives a new remote main file without automatically applying an old backup.
 
-Comando esperado de validação offline:
+Expected offline validation command:
 
 ```text
 python -m unittest -v test_sync.py
 ```
 
-### 5.2. Validação manual em lista de teste
+### 5.2. Manual validation on a test list
 
-Realizar somente quando o responsável indicar uma lista destinada a teste e fornecer as credenciais localmente. A ausência dessa preparação não impede implementar e validar offline, mas deve ser registrada como teste real pendente.
+Perform this only when the owner designates a test list and provides credentials locally. Missing preparation does not prevent offline implementation and validation, but must be recorded as a pending real test.
 
-- [ ] Configurar uma lista descartável de teste no mesmo modelo de organização por projeto e uma label de conclusão conhecida.
-- [ ] Executar importação com card contendo descrição, duas checklists, labels, comentário, anexo e datas.
-- [ ] Comparar o conteúdo importado com o card original, incluindo IDs de subtarefas e links de anexo.
-- [ ] Criar remotamente um novo card e confirmar criação do arquivo.
-- [ ] Alterar título e descrição remotamente e confirmar atualização local.
-- [ ] Alterar título e descrição localmente e confirmar atualização remota.
-- [ ] Marcar/desmarcar item, criar item/checklist e testar exclusão explícita de objeto de teste.
-- [ ] Associar/desassociar uma label comum sem alterar seu nome ou cor no quadro.
-- [ ] Renomear `todo-` para `done-` e vice-versa; verificar que nenhuma movimentação ocorreu.
-- [ ] Alterar a label de conclusão pelo Trello e verificar o prefixo.
-- [ ] Criar títulos repetidos, enormes e com imagem/URL; verificar nomes seguros e título integral preservado.
-- [ ] Alterar o mesmo card nos dois lados, verificar conflito e resolver cada uma das opções em cenários independentes.
-- [ ] Apagar um arquivo local e verificar recriação.
-- [ ] Mover um card de teste para outra lista e verificar retirada recuperável no projeto original.
-- [ ] Arquivar um card de teste ainda na lista e confirmar que continua presente no planejamento local.
-- [ ] Excluir definitivamente apenas um card descartável de teste e verificar a regra de ausência e recuperação local.
-- [ ] Reexecutar sem novas alterações e confirmar ausência de escritas desnecessárias.
-- [ ] Executar em Windows, Linux e macOS quando houver ambientes disponíveis; registrar os sistemas efetivamente testados, sem declarar portabilidade testada onde houve apenas revisão de código.
+- [ ] Configure a disposable test list using the same project-based organization model.
+- [ ] Run an import with a card containing a description, two checklists, labels, a comment, an attachment and dates.
+- [ ] Compare imported content with the original card, including subtask IDs and attachment links.
+- [ ] Create a new card remotely and confirm file creation.
+- [ ] Change the title and description remotely and confirm local update.
+- [ ] Change the title and description locally and confirm remote update.
+- [ ] Check/uncheck an item, create an item/checklist and test explicit deletion of a test object.
+- [ ] Associate/disassociate an ordinary label without changing its board name or color.
+- [ ] Rename `todo-` to `done-` and vice versa; verify that no movement occurred.
+- [ ] Check/uncheck the native due-date checkbox in Trello and verify the prefix while labels have no effect on status.
+- [ ] Create repeated, huge and image/URL titles; verify safe names and preservation of the full title.
+- [ ] Change the same card on both sides, verify the conflict and resolve each option in independent scenarios.
+- [ ] Delete a local file and verify recreation.
+- [ ] Move a test card to another list and verify recoverable removal in the original project.
+- [ ] Archive a test card that is still in the list and confirm that it remains in the local plan.
+- [ ] Permanently delete only a disposable test card and verify the absence and local recovery rule.
+- [ ] Run again without new changes and confirm the absence of unnecessary writes.
+- [ ] Run on Windows, Linux and macOS when environments are available; record systems actually tested without claiming portability based only on code review.
 
-### 5.3. Aceitação por entrega
+### 5.3. Delivery acceptance
 
-| Entrega | Condição mínima para marcar concluída |
+| Delivery | Minimum condition to mark complete |
 | --- | --- |
-| Configuração e transporte | Sem dependências, validação anterior a mutações, erros HTTP previsíveis e logs redigidos. |
-| Importação | Um arquivo por card, incluindo arquivados da lista; conteúdo completo acessível e parser com round-trip validado. |
-| Identidade e títulos | Renomeações e duplicatas não perdem IDs, não truncam título original e não sobrescrevem arquivos. |
-| Escrita bidirecional | Título, descrição, checklists, labels e prefixo sincronizam pelos contratos descritos. |
-| Conflitos | Base/local/remoto preservados; resolução explícita, versionada e protegida contra decisão obsoleta. |
-| Falhas parciais | Nenhum POST ambíguo repetido automaticamente; pendências retomáveis e reportadas. |
-| Remoções | Principal sai do escopo ativo com recuperação; falha de inventário não provoca limpeza. |
-| Idempotência | Execução repetida sem mudanças não escreve no Trello nem regrava Markdown. |
-| Distribuição | Script, modelo de configuração, README e testes suficientes para copiar e operar por projeto. |
+| Configuration and transport | No dependencies, validation before mutations, predictable HTTP errors and redacted logs. |
+| Import | One file per card, including archived cards in the list; complete accessible content and a validated round-trip parser. |
+| Identity and titles | Renames and duplicates preserve IDs, do not truncate the original title and do not overwrite files. |
+| Bidirectional writes | Title, description, checklists, labels and prefix synchronize according to the described contracts. |
+| Conflicts | Base/local/remote preserved; explicit, versioned resolution protected against obsolete decisions. |
+| Partial failures | No ambiguous POST repeated automatically; pending work is resumable and reported. |
+| Removals | Main file leaves the active scope with recovery; inventory failure does not cause cleanup. |
+| Idempotence | A repeated run without changes writes neither to Trello nor to Markdown. |
+| Distribution | Script, configuration template, README and tests sufficient to copy and operate per project. |
 
-### 5.4. Checklist final do agente implementador
+### 5.4. Implementing agent's final checklist
 
-- [ ] Todos os requisitos funcionais acordados foram implementados ou identificados claramente como pendências.
-- [ ] Nenhuma dependência externa foi adicionada.
-- [ ] Nenhum token ou conteúdo privado foi incluído em exemplos versionáveis.
-- [ ] A versão-base só avança depois de confirmação remota e persistência local.
-- [ ] Os cenários críticos de conflito, remoção e falha parcial foram executados em testes offline.
-- [ ] O README descreve o formato real produzido pelo script, sem divergência com o parser.
-- [ ] O contrato de `schema_version: 1` e a versão do script estão coerentes.
-- [ ] Os testes passaram e as evidências foram registradas abaixo.
-- [ ] A validação real no Trello foi realizada em lista de teste ou está explicitamente marcada como pendente.
-- [ ] Os sistemas efetivamente testados estão registrados.
-- [ ] Nenhum commit foi criado sem autorização explícita.
-- [ ] As caixas deste documento foram atualizadas conforme resultados reais, sem marcar automaticamente blocos inteiros.
+- [ ] All agreed functional requirements were implemented or clearly identified as pending.
+- [ ] No external dependency was added.
+- [ ] No token or private content was included in versionable examples.
+- [ ] The base version advances only after remote confirmation and local persistence.
+- [ ] Critical conflict, removal and partial-failure scenarios were run in offline tests.
+- [ ] README describes the actual format produced by the script without diverging from the parser.
+- [ ] The `schema_version: 1` contract and script version are consistent.
+- [ ] Tests passed and evidence was recorded below.
+- [ ] Real Trello validation was performed on a test list or is explicitly marked pending.
+- [ ] Systems actually tested are recorded.
+- [ ] No commit was created without explicit authorization.
+- [ ] This document's checkboxes were updated according to real results without automatically marking entire blocks.
 
-### 5.5. Registro de execução a preencher futuramente
+### 5.5. Execution record
 
-| Bloco / cenário | Data | Resultado | Evidência ou comando | Pendência |
+| Block / scenario | Date | Result | Evidence or command | Pending |
 | --- | --- | --- | --- | --- |
-| Implementação | — | Não iniciada | Este documento é somente planejamento | Todos os blocos de implementação |
-| Testes offline | — | Não executados | A executar pelo próximo agente | `test_sync.py` |
-| Integração Trello | — | Não executada | Exige lista de teste e credenciais locais | Ambiente de teste |
-| Windows | — | Não validado | — | Executar testes |
-| Linux | — | Não validado | — | Executar testes |
-| macOS | — | Não validado | — | Executar testes |
+| Implementation | 14/09/2026 | Initially implemented | `sync.py`, `.env.example`, `.gitignore`, `README.md`, `test_sync.py` | Real integration and unproven requirements remain pending |
+| Version and TXT import | 14/09/2026 | Implemented | `SCRIPT_VERSION=1.0.0`, `CHANGELOG.md`, `python sync.py --import`, 69 offline tests | Real integration remains pending |
+| Template and local creation | 14/09/2026 | Implemented | `PLAN/_modelo-card.md` generated by `sync.py`; test `test_sync_keeps_template_and_creates_card_from_its_copy`; TXT import coverage | Validate on a disposable Trello list |
+| Offline tests | 14/09/2026 | 69 tests passed | `python -m unittest -v test_sync.py` | Expand coverage according to section 5.1 |
+| Syntax/CLI | 14/09/2026 | Passed | `python -m py_compile sync.py test_sync.py`; `python sync.py --help`; `python sync.py --version` | — |
+| Trello integration | 14/09/2026 | Not run | Requires a test list and local credentials | Test environment |
+| Windows | 14/09/2026 | Validated offline in the development environment | Tests run in PowerShell/Python 3.11+ | Validate with a Trello test list |
+| Linux | — | Not validated | — | Run tests |
+| macOS | — | Not validated | — | Run tests |
 
-O próximo agente deverá usar este arquivo como roteiro de execução e manter visíveis as limitações que não conseguiu validar. O término do planejamento não equivale ao término do produto.
+The execution/validation agent must use this file as an execution guide and keep limitations that have not yet been validated visible. The initial implementation is ready for controlled validation; completing this stage is not equivalent to validating integration on a real Trello board.
