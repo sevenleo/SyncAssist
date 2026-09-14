@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.1] - 2026-09-14
+
+### Fixed
+
+- Preserved imported description newlines and import provenance after card recovery.
+- Separated editable synchronization state from volatile read-only Trello references.
+- Reconciled unconfirmed card creation without repeating POST requests.
+- Hardened pagination, incomplete inventory handling, due-date clearing and conflict filenames.
+
 ## [1.0.0] - 2026-09-14
 
 ### Added

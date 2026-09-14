@@ -9,6 +9,7 @@ from sync import (
     AmbiguousOperation,
     ConfigError,
     Config,
+    IncompleteInventory,
     SCRIPT_VERSION,
     METADATA_BEGIN,
     METADATA_END,
@@ -178,6 +179,21 @@ class FilenameTests(unittest.TestCase):
 
 
 class DocumentTests(unittest.TestCase):
+    def test_description_round_trip_preserves_trailing_newlines(self):
+        for description in ("", "Task", "Task\n", "Task\n\n"):
+            with self.subTest(description=repr(description)):
+                metadata = {
+                    "managed_by": "syncassist",
+                    "schema_version": SCHEMA_VERSION,
+                    "role": "card",
+                    "section_token": "abc123",
+                    "content": projection(description=description),
+                    "reference": {},
+                    "sync": {"reference_hash": canonical_hash({})},
+                }
+                parsed = parse_document(Path("todo-card.md"), render_document(metadata))
+                self.assertEqual(parsed.projection["description"], description)
+
     def test_document_starts_with_human_summary_and_parses_edited_title(self):
         document = render_document(
             {
@@ -484,6 +500,98 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn("token=token", seen[0][0])
         self.assertEqual(seen[0][1], "PUT")
 
+    def test_update_card_can_clear_due_date(self):
+        root = Path(tempfile.mkdtemp())
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return self.Response({"id": "abcdef1234567890abcdef56"})
+
+        TrelloClient(config, opener=opener).update_card(
+            "abcdef1234567890abcdef56", {"due": None, "dueComplete": False}
+        )
+        self.assertIn("due=null", seen[0])
+        self.assertIn("dueComplete=false", seen[0])
+
+    def test_label_inventory_paginates_and_rejects_repeated_cursor(self):
+        root = Path(tempfile.mkdtemp())
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        first_page = [{"id": f"{index:024x}"} for index in range(1000)]
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            return self.Response(first_page if len(calls) == 1 else [])
+
+        labels = TrelloClient(config, opener=opener).get_board_labels("abcdef1234567890abcdef56")
+        self.assertEqual(len(labels), 1000)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("before=0000000000000000000003e7", calls[1])
+
+        def repeating(request, timeout):
+            return self.Response(first_page)
+
+        with self.assertRaises(IncompleteInventory):
+            TrelloClient(config, opener=repeating).get_board_labels("abcdef1234567890abcdef56")
+
+    def test_action_pagination_detects_repeated_cursor(self):
+        root = Path(tempfile.mkdtemp())
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        page = [{"id": f"{index:024x}", "date": str(index)} for index in range(1000)]
+
+        with self.assertRaises(IncompleteInventory):
+            TrelloClient(config, opener=lambda request, timeout: self.Response(page))._paged_actions(
+                "abcdef1234567890abcdef56"
+            )
+
+    def test_card_bundle_rejects_an_incomplete_optional_resource(self):
+        root = Path(tempfile.mkdtemp())
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        responses = [
+            {"id": "abcdef1234567890abcdef56"},
+            [],
+            [],
+            [],
+            {},
+            [],
+        ]
+
+        def opener(request, timeout):
+            return self.Response(responses.pop(0))
+
+        with self.assertRaises(IncompleteInventory):
+            TrelloClient(config, opener=opener).get_card_bundle("abcdef1234567890abcdef56")
+
     def test_create_card_uses_the_configured_list_without_query_credentials(self):
         root = Path(tempfile.mkdtemp())
         config = Config.from_values(
@@ -549,8 +657,8 @@ class SetupTests(unittest.TestCase):
             build_parser().parse_args(["--setup", "--import"])
         self.assertEqual(context.exception.code, 2)
 
-    def test_product_version_is_one_zero_zero(self):
-        self.assertEqual(SCRIPT_VERSION, "1.0.0")
+    def test_product_version_is_one_zero_one(self):
+        self.assertEqual(SCRIPT_VERSION, "1.0.1")
 
     def test_main_runs_sync_after_successful_setup(self):
         config = object()
@@ -1137,7 +1245,7 @@ class SyncOnceTests(unittest.TestCase):
         report = sync_once(config, api, now="2026-09-14T00:01:00Z")
         self.assertEqual(report["created"], 1)
         self.assertEqual(api.bundle["card"]["name"], "People")
-        self.assertEqual(api.bundle["card"]["desc"], "Task description.")
+        self.assertEqual(api.bundle["card"]["desc"], "Task description.\n")
         self.assertEqual(api.bundle["card"]["idList"], config.list_id)
         self.assertTrue(template.exists())
         self.assertTrue(new_path.exists())
@@ -1484,6 +1592,38 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(parsed.projection["description"], "Remote description")
         self.assertEqual(report["updated"], 1)
 
+    def test_local_read_only_edit_is_preserved_without_a_conflict(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        original = path.read_text(encoding="utf-8")
+        path.write_text(original.replace("> **Due date:** not defined", "> **Due date:** local note"), encoding="utf-8")
+        api.bundle["card"]["desc"] = "Remote description"
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertEqual(report["conflicts"], 0)
+        self.assertEqual(len(report["warnings"]), 1)
+        self.assertIn("> **Due date:** local note", path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            parse_document(path, path.read_text(encoding="utf-8")).projection["description"],
+            "Remote description",
+        )
+
+    def test_board_label_inventory_change_does_not_create_a_conflict(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        api.labels.append({"id": "abcdef1234567890abcdef78", "name": "Another", "color": "blue"})
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertEqual(report["conflicts"], 0)
+        self.assertEqual(report["failures"], 0)
+
     def test_remote_due_complete_changes_the_filename(self):
         root = Path(tempfile.mkdtemp())
         config = self.make_config(root)
@@ -1554,6 +1694,60 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(report["conflicts"], 0)
         self.assertEqual(report["pushed"], 1)
 
+    def test_ambiguous_new_card_creation_is_reconciled_without_a_duplicate(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        api.cards = []
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        template = root / "PLAN" / TEMPLATE_FILENAME
+        new_path = root / "PLAN" / "todo-people.md"
+        new_path.write_text(
+            template.read_text(encoding="utf-8").replace("# New task", "# People", 1),
+            encoding="utf-8",
+        )
+        original_create = api.create_card
+
+        def create_then_lose_response(*args, **kwargs):
+            original_create(*args, **kwargs)
+            raise AmbiguousOperation("lost create response")
+
+        api.create_card = create_then_lose_response
+        first = sync_once(config, api, now="2026-09-14T00:01:00Z")
+        self.assertGreaterEqual(first["failures"], 1)
+        self.assertEqual(len(api.cards), 1)
+
+        api.create_card = original_create
+        second = sync_once(config, api, now="2026-09-14T00:02:00Z")
+
+        self.assertEqual(len(api.cards), 1)
+        self.assertEqual(second["conflicts"], 0)
+        self.assertTrue(parse_document(new_path, new_path.read_text(encoding="utf-8")).metadata["trello_card_id"])
+
+    def test_import_source_survives_card_recovery(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        metadata = parse_document(path, path.read_text(encoding="utf-8")).metadata
+        metadata["import_source"] = {"relative_path": "source.txt", "sha256": "a" * 64}
+        path.write_text(render_document(metadata), encoding="utf-8")
+
+        api.bundle["card"]["idList"] = "abcdef1234567890abcdef99"
+        api.cards = []
+        sync_once(config, api, now="2026-09-14T00:01:00Z")
+        self.assertFalse(path.exists())
+
+        api.bundle["card"]["idList"] = config.list_id
+        api.cards = [api.bundle["card"]]
+        sync_once(config, api, now="2026-09-14T00:02:00Z")
+        recovered = next_plan_card(root)
+        recovered_metadata = parse_document(
+            recovered, recovered.read_text(encoding="utf-8")
+        ).metadata
+        self.assertEqual(recovered_metadata["import_source"]["relative_path"], "source.txt")
+
     def test_ambiguous_operation_is_not_repeated_on_the_next_run(self):
         root = Path(tempfile.mkdtemp())
         config = self.make_config(root)
@@ -1574,6 +1768,34 @@ class SyncOnceTests(unittest.TestCase):
         second = sync_once(config, api, now="2026-09-14T00:02:00Z")
         self.assertGreaterEqual(first["failures"], 1)
         self.assertEqual(second["conflicts"], 1)
+
+    def test_applied_ambiguous_checklist_creation_is_reconciled(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        metadata = parse_document(path, path.read_text(encoding="utf-8")).metadata
+        metadata["content"]["checklists"] = [
+            {"id": "new:acceptance", "name": "Acceptance", "items": []}
+        ]
+        path.write_text(render_document(metadata), encoding="utf-8")
+        original_create = api.create_checklist
+
+        def create_then_lose_response(*args, **kwargs):
+            original_create(*args, **kwargs)
+            raise AmbiguousOperation("lost checklist response")
+
+        api.create_checklist = create_then_lose_response
+        first = sync_once(config, api, now="2026-09-14T00:01:00Z")
+        self.assertGreaterEqual(first["failures"], 1)
+
+        api.create_checklist = original_create
+        second = sync_once(config, api, now="2026-09-14T00:02:00Z")
+
+        self.assertEqual(second["conflicts"], 0)
+        self.assertEqual(second["pushed"], 0)
+        self.assertEqual(len(api.bundle["checklists"]), 1)
 
     def test_lock_prevents_a_second_execution(self):
         root = Path(tempfile.mkdtemp())

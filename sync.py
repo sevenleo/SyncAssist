@@ -82,7 +82,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.trello.com/1"
 METADATA_BEGIN = "<!-- syncassist:metadata"
@@ -359,12 +359,25 @@ class TrelloClient:
         return result
 
     def get_board_labels(self, board_id: str) -> list[dict[str, Any]]:
-        result = self._request("GET", f"/boards/{board_id}/labels", params={"limit": 1000})
-        if not isinstance(result, list):
-            raise RemoteError("Trello labels response was not an array")
-        if len(result) >= 1000:
-            raise IncompleteInventory("label inventory reached its page limit")
-        return result
+        labels: list[dict[str, Any]] = []
+        before: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            page = self._request(
+                "GET",
+                f"/boards/{board_id}/labels",
+                params={"limit": 1000, "before": before},
+            )
+            if not isinstance(page, list):
+                raise IncompleteInventory("Trello labels response was not an array")
+            labels.extend(page)
+            if len(page) < 1000:
+                return labels
+            last_id = _trello_id(page[-1])
+            if not last_id or last_id in seen_cursors:
+                raise IncompleteInventory("Trello label pagination did not advance")
+            seen_cursors.add(last_id)
+            before = last_id
 
     def get_board_cards(self, board_id: str) -> list[dict[str, Any]]:
         cards: list[dict[str, Any]] = []
@@ -415,6 +428,7 @@ class TrelloClient:
     def _paged_actions(self, card_id: str) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
         before: str | None = None
+        seen_cursors: set[str] = set()
         while True:
             page = self._request(
                 "GET",
@@ -430,8 +444,9 @@ class TrelloClient:
                     key=lambda action: (str(action.get("date", "")), _trello_id(action)),
                 )
             last_id = _trello_id(page[-1])
-            if not last_id or last_id == before:
+            if not last_id or last_id in seen_cursors:
                 raise IncompleteInventory("Trello actions pagination did not advance")
+            seen_cursors.add(last_id)
             before = last_id
 
     def get_card_bundle(self, card_id: str) -> dict[str, Any]:
@@ -447,10 +462,8 @@ class TrelloClient:
         stickers = self._request("GET", f"/cards/{card_id}/stickers", params={"fields": "all"})
         if not isinstance(checklists, list) or not isinstance(attachments, list) or not isinstance(members, list):
             raise IncompleteInventory(f"incomplete card resources for {card_id}")
-        if not isinstance(custom_fields, list):
-            custom_fields = []
-        if not isinstance(stickers, list):
-            stickers = []
+        if not isinstance(custom_fields, list) or not isinstance(stickers, list):
+            raise IncompleteInventory(f"incomplete card resources for {card_id}")
         return {
             "card": card,
             "checklists": checklists,
@@ -463,6 +476,8 @@ class TrelloClient:
 
     def update_card(self, card_id: str, fields: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {key: fields[key] for key in ("name", "desc", "due", "dueComplete") if key in fields}
+        if "due" in allowed and allowed["due"] is None:
+            allowed["due"] = "null"
         if not allowed:
             return self.get_card(card_id)
         result = self._request("PUT", f"/cards/{card_id}", params=allowed)
@@ -875,6 +890,23 @@ def _reference_comments(reference: Any) -> list[Mapping[str, Any]]:
     ]
 
 
+def _read_only_snapshot(reference: Any) -> dict[str, Any]:
+    """Keep only stable reference data used to detect local read-only edits."""
+
+    card = _reference_card(reference)
+    stable_card = {
+        key: copy.deepcopy(card.get(key))
+        for key in ("id", "idBoard", "idList", "name", "desc", "due", "dueComplete", "url")
+        if key in card
+    }
+    comments = [copy.deepcopy(dict(comment)) for comment in _reference_comments(reference)]
+    return {"card": stable_card, "comments": comments}
+
+
+def _read_only_hash(reference: Any) -> str:
+    return canonical_hash(_read_only_snapshot(reference))
+
+
 def _render_summary(reference: Any) -> str:
     card = _reference_card(reference)
     due = html.escape(str(card.get("due") or "not defined"), quote=False)
@@ -952,8 +984,6 @@ def render_document(metadata: Mapping[str, Any]) -> str:
     reference = data.get("reference", {})
     title = str(content.get("title", ""))
     description = str(content.get("description", ""))
-    if description.endswith("\n"):
-        description = description[:-1]
     checklists = _render_checklists(content.get("checklists", []))
     status = str(data.get("status") or "todo")
     summary = _render_summary(reference)
@@ -1018,7 +1048,10 @@ def _render_new_card_template() -> str:
             "checklists": [],
         },
         "reference": {},
-        "sync": {"reference_hash": canonical_hash({})},
+        "sync": {
+            "reference_hash": canonical_hash({}),
+            "read_only_hash": _read_only_hash({}),
+        },
     }
     document = render_document(metadata)
     instructions = (
@@ -1245,9 +1278,13 @@ def parse_document(path: Path, text: str) -> ParsedDocument:
     stored_reference_hash = ((metadata.get("sync") or {}).get("reference_hash"))
     summary_section = _optional_section(text, token, "summary")
     comments_section = _optional_section(text, token, "comments")
-    read_only_changed = (
-        stored_reference_hash is not None and canonical_hash(reference) != stored_reference_hash
-    ) or (
+    stored_read_only_hash = ((metadata.get("sync") or {}).get("read_only_hash"))
+    reference_changed = (
+        _read_only_hash(reference) != stored_read_only_hash
+        if isinstance(stored_read_only_hash, str)
+        else stored_reference_hash is not None and canonical_hash(reference) != stored_reference_hash
+    )
+    read_only_changed = reference_changed or (
         summary_section is not None
         and _summary_comparison_key(summary_section)
         != _summary_comparison_key(_render_summary(reference))
@@ -1299,6 +1336,7 @@ def _new_report() -> dict[str, Any]:
         "unchanged": 0,
         "conflicts": 0,
         "failures": 0,
+        "warnings": [],
         "errors": [],
     }
 
@@ -1306,6 +1344,10 @@ def _new_report() -> dict[str, Any]:
 def _report_error(report: dict[str, Any], card_id: str | None, message: str) -> None:
     report["failures"] += 1
     report["errors"].append({"card_id": card_id, "message": message})
+
+
+def _report_warning(report: dict[str, Any], card_id: str | None, message: str) -> None:
+    report["warnings"].append({"card_id": card_id, "message": message})
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -1442,7 +1484,10 @@ def _import_template_metadata(source: ImportSource, title: str, description: str
             "checklists": [],
         },
         "reference": {},
-        "sync": {"reference_hash": canonical_hash({})},
+        "sync": {
+            "reference_hash": canonical_hash({}),
+            "read_only_hash": _read_only_hash({}),
+        },
         "import_source": {
             "relative_path": source.relative_path,
             "sha256": source.digest,
@@ -1677,8 +1722,7 @@ def _filename_plan(
             sync_data = parsed.metadata.get("sync") or {}
             base = sync_data.get("base")
             if (
-                parsed.read_only_changed
-                or _pending_requires_review(parsed)
+                _pending_requires_review(parsed)
                 or sync_data.get("conflict")
                 or not isinstance(base, Mapping)
                 or sync_data.get("base_hash") != canonical_hash(base)
@@ -1793,18 +1837,55 @@ def _metadata_for(
             "base": base_projection,
             "base_hash": canonical_hash(base_projection),
             "reference_hash": canonical_hash(remote_reference),
+            "read_only_hash": _read_only_hash(remote_reference),
             "pending": pending,
             "conflict": conflict,
             "resolution": resolution,
         }
     )
+    sync_data.pop("pending_create", None)
     existing["sync"] = sync_data
     existing.pop("trello_done_label_id", None)
     return existing
 
 
-def _write_card_document(path: Path, metadata: Mapping[str, Any]) -> None:
-    _atomic_write(path, render_document(metadata))
+def _preserve_read_only_sections(rendered: str, parsed: ParsedDocument | None) -> str:
+    if parsed is None or not parsed.read_only_changed:
+        return rendered
+    token = parsed.metadata.get("section_token")
+    if not isinstance(token, str):
+        return rendered
+    canonical = {
+        "summary": _render_summary(parsed.reference),
+        "comments": _render_comments(parsed.reference),
+    }
+    for section, expected in canonical.items():
+        local = _optional_section(parsed.raw_text, token, section)
+        if local is None or local == expected:
+            continue
+        begin = _section_marker(token, section, "begin")
+        end = _section_marker(token, section, "end")
+        start = rendered.find(begin)
+        finish = rendered.find(end, start + len(begin)) if start >= 0 else -1
+        if start < 0 or finish < 0:
+            continue
+        content_start = start + len(begin)
+        rendered = rendered[:content_start] + "\n" + local + "\n" + rendered[finish:]
+    return rendered
+
+
+def _write_card_document(
+    path: Path,
+    metadata: Mapping[str, Any],
+    *,
+    expected_text: str | None = None,
+    preserve_from: ParsedDocument | None = None,
+) -> None:
+    if expected_text is not None:
+        current = path.read_text(encoding="utf-8")
+        if current.replace("\r\n", "\n") != expected_text.replace("\r\n", "\n"):
+            raise SyncAssistError(f"file changed during synchronization: {path.name}")
+    _atomic_write(path, _preserve_read_only_sections(render_document(metadata), preserve_from))
 
 
 def _build_conflict_document(
@@ -1868,7 +1949,15 @@ def _conflict_info(
     now: str,
 ) -> dict[str, Any]:
     card_id = str(parsed.metadata.get("trello_card_id"))
-    conflict_id = uuid.uuid4().hex[:12]
+    conflict_id = canonical_hash(
+        {
+            "card_id": card_id,
+            "reason": reason,
+            "base": (parsed.metadata.get("sync") or {}).get("base"),
+            "local": parsed.projection,
+            "remote": remote_projection,
+        }
+    )[:12]
     conflict = {
         "conflict_id": conflict_id,
         "reason": reason,
@@ -1900,7 +1989,12 @@ def _conflict_info(
     sync_data["conflict"] = conflict
     sync_data["resolution"] = None
     metadata["sync"] = sync_data
-    _write_card_document(parsed.path, metadata)
+    _write_card_document(
+        parsed.path,
+        metadata,
+        expected_text=parsed.raw_text,
+        preserve_from=parsed,
+    )
     return conflict
 
 
@@ -2075,6 +2169,7 @@ def _write_or_rename_document(
     *,
     plan_dir: Path,
     expected_text: str | None = None,
+    preserve_from: ParsedDocument | None = None,
 ) -> bool:
     old_path = parsed.path if parsed else None
     _assert_safe_plan_file(target, plan_dir)
@@ -2085,7 +2180,7 @@ def _write_or_rename_document(
             if current.replace("\r\n", "\n") != expected_text.replace("\r\n", "\n"):
                 raise SyncAssistError(f"file changed during synchronization: {old_path.name}")
     _ensure_target_free(target, old_path)
-    rendered = render_document(metadata)
+    rendered = _preserve_read_only_sections(render_document(metadata), preserve_from)
     if old_path is not None and old_path == target:
         if old_path.read_text(encoding="utf-8") == rendered:
             return False
@@ -2099,6 +2194,21 @@ def _write_or_rename_document(
             pass
         return True
     return False
+
+
+def _recovery_import_source(plan_dir: Path, card_id: str) -> Mapping[str, Any] | None:
+    removed_dir = plan_dir / ".removed"
+    if not removed_dir.is_dir():
+        return None
+    for backup in sorted(removed_dir.glob(f"{card_id}-*.md"), key=lambda path: path.name, reverse=True):
+        try:
+            parsed = parse_document(backup, backup.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, TypeError):
+            continue
+        source = parsed.metadata.get("import_source")
+        if isinstance(source, Mapping):
+            return copy.deepcopy(dict(source))
+    return None
 
 
 def _remove_to_recovery(parsed: ParsedDocument, plan_dir: Path, now: str, reason: str) -> Path:
@@ -2375,6 +2485,7 @@ def _write_reconciled(
         metadata,
         plan_dir=config.plan_dir,
         expected_text=parsed.raw_text if parsed else None,
+        preserve_from=parsed,
     )
 
 
@@ -2383,6 +2494,103 @@ def _pending_requires_review(parsed: ParsedDocument) -> bool:
     if not pending:
         return False
     return any(operation.get("state") != "confirmed" for operation in pending.get("operations", []))
+
+
+def _pending_matches_remote(
+    parsed: ParsedDocument,
+    bundle: Mapping[str, Any],
+    remote_projection: Mapping[str, Any],
+) -> bool:
+    pending = (parsed.metadata.get("sync") or {}).get("pending")
+    if not isinstance(pending, Mapping):
+        return False
+    if parsed.projection == dict(remote_projection):
+        return True
+    operations = pending.get("operations")
+    if not isinstance(operations, list):
+        return False
+    checklists = _checklist_by_id(bundle)
+    base = (parsed.metadata.get("sync") or {}).get("base")
+    base_checklists = {
+        str(checklist.get("id"))
+        for checklist in (base.get("checklists", []) if isinstance(base, Mapping) else [])
+        if isinstance(checklist, Mapping)
+    }
+    for operation in operations:
+        if not isinstance(operation, Mapping) or operation.get("state") == "confirmed":
+            continue
+        kind = str(operation.get("kind", ""))
+        payload = operation.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        if kind == "create_checklist":
+            matches = [
+                checklist_id
+                for checklist_id, checklist in checklists.items()
+                if checklist_id not in base_checklists
+                and str(checklist.get("name", "")) == str(payload.get("name", ""))
+            ]
+            if len(matches) != 1:
+                return False
+            continue
+        if kind == "create_checkitem":
+            checklist = checklists.get(str(payload.get("checklist_id", "")))
+            if checklist is None:
+                return False
+            items = _item_by_id(checklist)
+            base_items = {
+                str(item.get("id"))
+                for base_checklist in (base.get("checklists", []) if isinstance(base, Mapping) else [])
+                if isinstance(base_checklist, Mapping)
+                for item in base_checklist.get("items", base_checklist.get("checkItems", []))
+                if isinstance(item, Mapping)
+            }
+            matches = [
+                item_id
+                for item_id, item in items.items()
+                if item_id not in base_items
+                and str(item.get("name", "")) == str(payload.get("name", ""))
+            ]
+            if len(matches) != 1:
+                return False
+            continue
+        return False
+    return True
+
+
+def _pending_create_matches(
+    pending: Mapping[str, Any],
+    bundles: Mapping[str, Mapping[str, Any]],
+    list_id: str,
+) -> list[tuple[str, Mapping[str, Any]]]:
+    payload = pending.get("payload")
+    if not isinstance(payload, Mapping):
+        return []
+    expected_name = str(payload.get("name", ""))
+    expected_description = str(payload.get("description", ""))
+    expected_done = payload.get("due_complete") is True
+    matches: list[tuple[str, Mapping[str, Any]]] = []
+    for card_id, bundle in bundles.items():
+        card = bundle.get("card") if isinstance(bundle.get("card"), Mapping) else {}
+        if (
+            _trello_id(card.get("idList")) == list_id
+            and str(card.get("name", "")) == expected_name
+            and str(card.get("desc", "")) == expected_description
+            and bool(card.get("dueComplete")) is expected_done
+        ):
+            matches.append((card_id, bundle))
+    return matches
+
+
+def _persist_pending_create(parsed: ParsedDocument, pending: Mapping[str, Any]) -> ParsedDocument:
+    metadata = copy.deepcopy(parsed.metadata)
+    metadata["content"] = copy.deepcopy(parsed.projection)
+    metadata["status"] = parsed.projection["status"]
+    sync_data = copy.deepcopy(metadata.get("sync") or {})
+    sync_data["pending_create"] = copy.deepcopy(dict(pending))
+    metadata["sync"] = sync_data
+    _write_card_document(parsed.path, metadata, expected_text=parsed.raw_text)
+    return parse_document(parsed.path, parsed.path.read_text(encoding="utf-8"))
 
 
 def _resolve_existing_conflict(
@@ -2394,6 +2602,7 @@ def _resolve_existing_conflict(
     filename: str,
     now: str,
     report: dict[str, Any],
+    bundles: Mapping[str, Mapping[str, Any]],
 ) -> bool:
     latest_bundle = api.get_card_bundle(str(parsed.metadata["trello_card_id"]))
     latest_projection = build_remote_projection(latest_bundle)
@@ -2471,8 +2680,14 @@ def _resolve_existing_conflict(
     parsed_after = parse_document(parsed.path, parsed.path.read_text(encoding="utf-8"))
     refreshed = api.get_card_bundle(str(parsed.metadata["trello_card_id"]))
     final_projection = build_remote_projection(refreshed)
-    final_filename = choose_filename(
-        final_projection["status"], final_projection["title"], str(parsed.metadata["trello_card_id"])
+    refreshed_bundles = dict(bundles)
+    refreshed_bundles[str(parsed.metadata["trello_card_id"])] = refreshed
+    final_filename = _new_card_filename(
+        config.plan_dir,
+        final_projection,
+        str(parsed.metadata["trello_card_id"]),
+        parsed_after.path,
+        refreshed_bundles,
     )
     renamed = _write_reconciled(
         config,
@@ -2496,6 +2711,7 @@ def _process_card(
     filename: str,
     now: str,
     report: dict[str, Any],
+    bundles: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     card_id = _trello_id((bundle.get("card") or {}).get("id"))
     remote_projection = build_remote_projection(bundle)
@@ -2504,10 +2720,27 @@ def _process_card(
         _assert_safe_plan_file(target, config.plan_dir)
         _ensure_target_free(target)
         metadata = _build_initial_metadata(config, bundle, remote_projection, filename, now)
+        import_source = _recovery_import_source(config.plan_dir, card_id)
+        if import_source is not None:
+            metadata["import_source"] = import_source
         _write_card_document(target, metadata)
         report["created"] += 1
         return
     if _pending_requires_review(parsed):
+        if _pending_matches_remote(parsed, bundle, remote_projection):
+            reconciled = _write_reconciled(
+                config,
+                parsed,
+                bundle,
+                remote_projection,
+                filename=filename,
+                now=now,
+                reference=bundle,
+                base=remote_projection,
+            )
+            report["updated"] += 1
+            report["renamed"] += int(reconciled)
+            return
         _conflict_info(
             config.plan_dir,
             parsed,
@@ -2519,20 +2752,23 @@ def _process_card(
         report["conflicts"] += 1
         return
     if _resolve_existing_conflict(
-        api, config, parsed, bundle, remote_projection, filename, now, report
+        api,
+        config,
+        parsed,
+        bundle,
+        remote_projection,
+        filename,
+        now,
+        report,
+        bundles or {card_id: bundle},
     ):
         return
     if parsed.read_only_changed:
-        _conflict_info(
-            config.plan_dir,
-            parsed,
-            bundle,
-            remote_projection,
-            reason="local_read_only_section_changed",
-            now=now,
+        _report_warning(
+            report,
+            card_id,
+            "local read-only sections were preserved and were not sent to Trello",
         )
-        report["conflicts"] += 1
-        return
     sync_data = parsed.metadata.get("sync") or {}
     base = sync_data.get("base")
     if not isinstance(base, Mapping) or sync_data.get("base_hash") != canonical_hash(base):
@@ -2575,7 +2811,7 @@ def _process_card(
         latest_bundle = api.get_card_bundle(card_id)
         latest_projection = build_remote_projection(latest_bundle)
         if latest_projection != remote_projection:
-            _process_card(api, config, parsed, latest_bundle, filename, now, report)
+            _process_card(api, config, parsed, latest_bundle, filename, now, report, bundles)
             return
         pushed = _apply_local_changes(api, config, parsed, bundle, remote_projection, now)
         parsed_after = parse_document(parsed.path, parsed.path.read_text(encoding="utf-8"))
@@ -2645,41 +2881,80 @@ def _process_new_card(
     bundles: Mapping[str, Mapping[str, Any]],
     now: str,
     report: dict[str, Any],
-) -> None:
+) -> str | None:
     _assert_safe_plan_file(parsed.path, config.plan_dir)
     local_projection = parsed.projection
     description = str(local_projection.get("description", ""))
     due = now if local_projection["status"] == "done" else None
-    created = api.create_card(
-        config.list_id,
-        str(local_projection["title"]),
-        description,
-        due=due,
-        due_complete=local_projection["status"] == "done",
-    )
-    card_id = _trello_id(created)
-    if not ID_PATTERN.fullmatch(card_id):
-        raise AmbiguousOperation("created card has no valid ID")
-    created_card = copy.deepcopy(dict(created))
-    created_card.update(
-        {
-            "id": card_id,
-            "idBoard": _trello_id(created_card.get("idBoard")) or config.board_id,
-            "idList": _trello_id(created_card.get("idList")) or config.list_id,
-            "idLabels": list(created_card.get("idLabels") or []),
-            "dueComplete": created_card.get("dueComplete") is True
-            or local_projection["status"] == "done",
+    pending = (parsed.metadata.get("sync") or {}).get("pending_create")
+    recovered = False
+    if isinstance(pending, Mapping):
+        matches = _pending_create_matches(pending, bundles, config.list_id)
+        if len(matches) == 1:
+            card_id, recovered_bundle = matches[0]
+            created = recovered_bundle.get("card") or {}
+            created_bundle = copy.deepcopy(dict(recovered_bundle))
+            recovered = True
+        else:
+            state = str(pending.get("state", "sent_unconfirmed"))
+            if state != "not_sent" or len(matches) > 1:
+                report["conflicts"] += 1
+                _report_error(
+                    report,
+                    None,
+                    "pending card creation requires manual reconciliation; no new card was created",
+                )
+                return None
+            pending = None
+    if not recovered:
+        payload = {
+            "list_id": config.list_id,
+            "name": str(local_projection["title"]),
+            "description": description,
+            "due": due,
+            "due_complete": local_projection["status"] == "done",
         }
-    )
-    created_bundle: dict[str, Any] = {
-        "card": created_card,
-        "checklists": [],
-        "actions": [],
-        "attachments": [],
-        "members": [],
-        "custom_field_items": [],
-        "stickers": [],
-    }
+        if not isinstance(pending, Mapping):
+            pending = {
+                "execution_id": uuid.uuid4().hex,
+                "started_at": now,
+                "state": "not_sent",
+                "payload": payload,
+            }
+            parsed = _persist_pending_create(parsed, pending)
+        pending = dict(pending)
+        pending["state"] = "sent_unconfirmed"
+        parsed = _persist_pending_create(parsed, pending)
+        created = api.create_card(
+            config.list_id,
+            str(local_projection["title"]),
+            description,
+            due=due,
+            due_complete=local_projection["status"] == "done",
+        )
+        card_id = _trello_id(created)
+        if not ID_PATTERN.fullmatch(card_id):
+            raise AmbiguousOperation("created card has no valid ID")
+        created_card = copy.deepcopy(dict(created))
+        created_card.update(
+            {
+                "id": card_id,
+                "idBoard": _trello_id(created_card.get("idBoard")) or config.board_id,
+                "idList": _trello_id(created_card.get("idList")) or config.list_id,
+                "idLabels": list(created_card.get("idLabels") or []),
+                "dueComplete": created_card.get("dueComplete") is True
+                or local_projection["status"] == "done",
+            }
+        )
+        created_bundle = {
+            "card": created_card,
+            "checklists": [],
+            "actions": [],
+            "attachments": [],
+            "members": [],
+            "custom_field_items": [],
+            "stickers": [],
+        }
     remote_projection = build_remote_projection(created_bundle)
     provisional_metadata = _metadata_for(
         config,
@@ -2724,6 +2999,7 @@ def _process_new_card(
     report["created"] += 1
     report["pushed"] += int(pushed)
     report["renamed"] += int(renamed)
+    return card_id
 
 
 def _validate_remote_scope(
@@ -2807,23 +3083,12 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
                 _report_error(report, card_id, f"remote card read failed: {type(exc).__name__}")
             except Exception as exc:  # one card must not stop independent cards
                 _report_error(report, card_id, f"remote card read failed: {type(exc).__name__}")
-        filenames = _filename_plan(bundles, local_documents)
-        local_documents = _stage_filename_conflicts(config.plan_dir, local_documents, filenames)
-        for card_id in sorted(bundles):
-            parsed = local_documents.get(card_id)
-            try:
-                _process_card(client, config, parsed, bundles[card_id], filenames[card_id], current_time, report)
-            except ConfigError:
-                raise
-            except RemoteError as exc:
-                if exc.status == 401:
-                    raise
-                _report_error(report, card_id, f"card processing failed: {type(exc).__name__}")
-            except Exception as exc:
-                _report_error(report, card_id, f"card processing failed: {type(exc).__name__}: {exc}")
+        created_card_ids: set[str] = set()
         for parsed in new_documents:
             try:
-                _process_new_card(client, config, parsed, bundles, current_time, report)
+                created_card_id = _process_new_card(client, config, parsed, bundles, current_time, report)
+                if created_card_id:
+                    created_card_ids.add(created_card_id)
             except ConfigError:
                 raise
             except RemoteError as exc:
@@ -2832,8 +3097,33 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
                 _report_error(report, None, f"new card creation failed: {type(exc).__name__}")
             except Exception as exc:
                 _report_error(report, None, f"new card creation failed: {type(exc).__name__}: {exc}")
+
+        local_documents, _ = _load_local_documents(config.plan_dir, config, report)
+        filenames = _filename_plan(bundles, local_documents)
+        local_documents = _stage_filename_conflicts(config.plan_dir, local_documents, filenames)
+        for card_id in sorted(bundles):
+            parsed = local_documents.get(card_id)
+            try:
+                _process_card(
+                    client,
+                    config,
+                    parsed,
+                    bundles[card_id],
+                    filenames[card_id],
+                    current_time,
+                    report,
+                    bundles,
+                )
+            except ConfigError:
+                raise
+            except RemoteError as exc:
+                if exc.status == 401:
+                    raise
+                _report_error(report, card_id, f"card processing failed: {type(exc).__name__}")
+            except Exception as exc:
+                _report_error(report, card_id, f"card processing failed: {type(exc).__name__}: {exc}")
         for card_id, parsed in sorted(local_documents.items()):
-            if card_id in cards_by_id:
+            if card_id in cards_by_id or card_id in created_card_ids:
                 continue
             try:
                 state, remote_card = _remote_card_for_missing(
@@ -2871,6 +3161,9 @@ def _print_report(report: Mapping[str, Any], *, output: Any = sys.stdout, errors
     for error in report.get("errors", []):
         card_id = error.get("card_id") or "project"
         print(f"ERROR [{card_id}] {error['message']}", file=errors)
+    for warning in report.get("warnings", []):
+        card_id = warning.get("card_id") or "project"
+        print(f"WARNING [{card_id}] {warning['message']}", file=errors)
 
 
 def _exit_code(report: Mapping[str, Any]) -> int:

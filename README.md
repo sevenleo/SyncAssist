@@ -4,7 +4,7 @@ Local digital secretary for synchronizing a Trello list with a project's Markdow
 
 Each copy of `sync.py` represents one Trello list. When the script runs, it creates `PLAN/` and writes one file per card. The card ID is stored in the file's metadata, so title changes do not break the link.
 
-Current product version: `1.0.0`. See [CHANGELOG.md](CHANGELOG.md) for the simplified release history.
+Current product version: `1.0.1`. See [CHANGELOG.md](CHANGELOG.md) for the simplified release history.
 
 ## Requirements
 
@@ -190,6 +190,8 @@ The script compares the base version from the last synchronization with the curr
 
 A conflict does not change Trello. The conflict file contains the base, local version and remote version. After reviewing it, edit the main file and fill `sync.resolution` with the `conflict_id`, expected remote hash and a `local`, `remote` or `merged` choice. The decision is accepted only if the remote still has the expected hash.
 
+Manual edits to the read-only summary or comments sections are preserved locally and reported as warnings; they are never sent to Trello and do not create editable-content conflicts. Volatile reference changes such as board label inventory or non-comment history are not treated as conflicts.
+
 Deleting the conflict artifact does not choose a version. If it disappears without a valid resolution, it is recreated.
 
 ## Removal and recovery
@@ -199,6 +201,8 @@ Cards that leave the configured list no longer belong to the project. The main f
 Deleting a local file does not delete the card. If the card is still in the list, the script recreates it on the next run using the current Trello state.
 
 Cards moved to another list or no longer accessible are removed from the active root and preserved in `PLAN/.removed/` with a `.reason.json` file. `PLAN/.conflicts/` stores conflict revisions and is not processed as cards.
+
+When a recovered card has an `import_source`, the new active document keeps that provenance without restoring the old TXT content automatically.
 
 During a simultaneous name swap, the script may temporarily use `PLAN/.sync-staging/` to free paths without overwriting files. If an interruption leaves files there, pause new runs and manually return them to the active root after checking their IDs.
 
@@ -227,6 +231,16 @@ python -m py_compile sync.py test_sync.py
 ```
 
 For a real test, use a disposable Trello list. The client queries the list, cards, checklists, actions, attachments, members, custom fields, stickers and labels available to the token. Check routes and fields in the [official API reference](https://developer.atlassian.com/cloud/trello/rest/), especially [lists](https://developer.atlassian.com/cloud/trello/rest/api-group-lists/), [cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/), [checklists](https://developer.atlassian.com/cloud/trello/rest/api-group-checklists/) and [rate limits](https://developer.atlassian.com/cloud/trello/guides/rest-api/rate-limits/).
+
+The repository includes a disposable real-test workspace in `teste/`. Its `sync.py` reads `teste/.env` and `teste/PLAN`, so run it without `--setup` and leave a safe interval between complete executions:
+
+```powershell
+python teste\sync.py --version
+python teste\sync.py
+python teste\sync.py --import
+```
+
+Use only a Trello list dedicated to testing. Inspect the summary, `teste/PLAN/.conflicts`, `teste/PLAN/.removed` and `teste/PLAN/.imported` after each scenario.
 
 ## Deliberate limitations
 
