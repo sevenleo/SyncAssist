@@ -1,6 +1,7 @@
 import io
 import json
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -522,6 +523,43 @@ class ClientTests(unittest.TestCase):
         self.assertIn("due=null", seen[0])
         self.assertIn("dueComplete=false", seen[0])
 
+    def test_rate_limit_retry_reports_wait_without_exposing_credentials(self):
+        root = Path(tempfile.mkdtemp())
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        calls = []
+        messages = []
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    429,
+                    "rate limited",
+                    {"Retry-After": "2"},
+                    io.BytesIO(),
+                )
+            return self.Response({"id": "abcdef1234567890abcdef56"})
+
+        with mock.patch("sync.time.sleep") as sleep:
+            result = TrelloClient(config, opener=opener, progress=messages.append).get_board(
+                "abcdef1234567890abcdef56"
+            )
+
+        self.assertEqual(result["id"], "abcdef1234567890abcdef56")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Trello pediu espera de 2.0s", messages[0])
+        self.assertNotIn("key", messages[0])
+        self.assertNotIn("token", messages[0])
+        sleep.assert_any_call(2.0)
+
     def test_label_inventory_paginates_and_rejects_repeated_cursor(self):
         root = Path(tempfile.mkdtemp())
         config = Config.from_values(
@@ -657,8 +695,8 @@ class SetupTests(unittest.TestCase):
             build_parser().parse_args(["--setup", "--import"])
         self.assertEqual(context.exception.code, 2)
 
-    def test_product_version_is_one_zero_one(self):
-        self.assertEqual(SCRIPT_VERSION, "1.0.1")
+    def test_product_version_is_one_zero_two(self):
+        self.assertEqual(SCRIPT_VERSION, "1.0.2")
 
     def test_main_runs_sync_after_successful_setup(self):
         config = object()
@@ -671,7 +709,9 @@ class SetupTests(unittest.TestCase):
 
         setup.assert_called_once()
         load_config.assert_called_once()
-        sync_call.assert_called_once_with(config)
+        sync_call.assert_called_once()
+        self.assertIs(sync_call.call_args.args[0], config)
+        self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
         print_report.assert_called_once_with(report)
 
     def test_main_does_not_sync_when_setup_is_cancelled(self):
@@ -697,7 +737,9 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(main(["--import"]), 0)
 
         import_tasks.assert_called_once_with(config)
-        sync_call.assert_called_once_with(config)
+        sync_call.assert_called_once()
+        self.assertIs(sync_call.call_args.args[0], config)
+        self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
         finalize.assert_called_once_with(config, import_result)
         print_import.assert_called_once_with(import_result)
         print_report.assert_called_once_with(report)
@@ -712,7 +754,9 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(main([]), 0)
 
         import_tasks.assert_not_called()
-        sync_call.assert_called_once_with(config)
+        sync_call.assert_called_once()
+        self.assertIs(sync_call.call_args.args[0], config)
+        self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
         print_report.assert_called_once_with(report)
 
 
@@ -884,6 +928,7 @@ class FakeApi:
         self.updated = []
         self.label_changes = []
         self.checkitem_updates = []
+        self.bundle_reads = 0
 
     def get_list(self, list_id):
         return {"id": self.list_id, "idBoard": self.board_id, "name": "Project", "closed": False}
@@ -898,6 +943,7 @@ class FakeApi:
         return list(self.cards)
 
     def get_card_bundle(self, card_id):
+        self.bundle_reads += 1
         if self.bundle["card"]["id"] != card_id:
             raise KeyError(card_id)
         return self.bundle
@@ -1379,10 +1425,21 @@ class SyncOnceTests(unittest.TestCase):
         api.bundle = sample_bundle("Remote description")
         api.cards = [api.bundle["card"]]
 
-        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+        messages = []
+        report = sync_once(
+            config,
+            api,
+            now="2026-09-14T00:01:00Z",
+            progress=messages.append,
+        )
         self.assertFalse(api.updated)
         self.assertEqual(report["conflicts"], 1)
         self.assertEqual(len(list((root / "PLAN" / ".conflicts").glob("*.md"))), 1)
+        conflict_message = next(message for message in messages if "CONFLITO" in message)
+        self.assertIn("local=TODO", conflict_message)
+        self.assertIn("Trello=TODO", conflict_message)
+        self.assertIn("Nada foi enviado", conflict_message)
+        self.assertIn("Artefato: .conflicts", conflict_message)
 
     def test_recreates_a_deleted_conflict_artifact_without_overwriting_the_card(self):
         root = Path(tempfile.mkdtemp())
@@ -1459,6 +1516,62 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mtime_ns, original_mtime)
         self.assertFalse(api.updated)
         self.assertFalse(api.label_changes)
+        self.assertEqual(api.bundle_reads, 2)
+
+    def test_progress_reports_each_phase_and_card_status(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        messages = []
+
+        sync_once(config, api, now="2026-09-14T00:00:00Z", progress=messages.append)
+
+        self.assertIn("validando configuracao e inventario", messages[0])
+        self.assertTrue(any("inventario pronto" in message for message in messages))
+        self.assertTrue(any("lendo card 1/1" in message for message in messages))
+        self.assertTrue(any("sincronizando card 1/1" in message for message in messages))
+        self.assertTrue(any("sincronizacao concluida em" in message for message in messages))
+
+    def test_stale_read_only_conflict_does_not_block_remote_status(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        parsed = parse_document(path, path.read_text(encoding="utf-8"))
+        metadata = parsed.metadata
+        metadata["sync"]["conflict"] = {
+            "conflict_id": "legacy123456",
+            "created_at": "2026-09-14T00:00:00Z",
+            "expected_remote_hash": canonical_hash(parsed.projection),
+            "reason": "local_read_only_section_changed",
+        }
+        metadata["sync"]["resolution"] = None
+        path.write_text(render_document(metadata), encoding="utf-8")
+        artifact = root / "PLAN" / ".conflicts" / f"{api.bundle['card']['id']}-legacy123456.md"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("legacy conflict record\n", encoding="utf-8")
+        api.bundle["card"]["dueComplete"] = True
+        messages = []
+
+        report = sync_once(
+            config,
+            api,
+            now="2026-09-14T00:01:00Z",
+            progress=messages.append,
+        )
+
+        self.assertEqual(report["conflicts"], 0)
+        self.assertEqual(report["renamed"], 1)
+        self.assertTrue((root / "PLAN" / "done-card.md").exists())
+        self.assertFalse(path.exists())
+        self.assertEqual(artifact.read_text(encoding="utf-8"), "legacy conflict record\n")
+        final = parse_document(
+            root / "PLAN" / "done-card.md",
+            (root / "PLAN" / "done-card.md").read_text(encoding="utf-8"),
+        )
+        self.assertIsNone(final.metadata["sync"].get("conflict"))
+        self.assertTrue(any("conflito antigo somente leitura liberado" in message for message in messages))
 
     def test_updates_existing_checklist_item_without_recreating_it(self):
         root = Path(tempfile.mkdtemp())

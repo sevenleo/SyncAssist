@@ -4,7 +4,7 @@ Local digital secretary for synchronizing a Trello list with a project's Markdow
 
 Each copy of `sync.py` represents one Trello list. When the script runs, it creates `PLAN/` and writes one file per card. The card ID is stored in the file's metadata, so title changes do not break the link.
 
-Current product version: `1.0.1`. See [CHANGELOG.md](CHANGELOG.md) for the simplified release history.
+Current product version: `1.0.2`. See [CHANGELOG.md](CHANGELOG.md) for the simplified release history.
 
 ## Requirements
 
@@ -40,6 +40,8 @@ python sync.py
 ```
 
 The command is automatic and does not ask for confirmation. A run with no changes returns `0` and does not rewrite cards or files.
+
+During synchronization the terminal shows the current phase and card, for example `lendo card 2/5` and `sincronizando card 2/5`. The script reads complementary Trello resources sequentially to respect the API limit, so a card can require several requests. Rate-limit responses and retries are announced with the wait time, and the final line includes the elapsed time and number of Trello requests.
 
 The template `.gitignore` also ignores `PLAN/`, because its documents may contain private Trello data. If the project needs to version these plans, remove that rule deliberately and also review `.conflicts/` and `.removed/`.
 
@@ -187,6 +189,8 @@ The script compares the base version from the last synchronization with the curr
 - only Trello changed: update the file;
 - only the file changed: send editable fields to Trello;
 - both changed differently: preserve the main file and create `PLAN/.conflicts/`.
+
+Conflicts are also printed immediately with the local status, Trello status, reason and artifact path. A historical `local_read_only_section_changed` conflict from older versions is released automatically when the current editable three-way comparison is not a real conflict; its file in `.conflicts/` is preserved.
 
 A conflict does not change Trello. The conflict file contains the base, local version and remote version. After reviewing it, edit the main file and fill `sync.resolution` with the `conflict_id`, expected remote hash and a `local`, `remote` or `merged` choice. The decision is accepted only if the remote still has the expected hash.
 

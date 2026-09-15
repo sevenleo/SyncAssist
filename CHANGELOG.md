@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.2] - 2026-09-14
+
+### Fixed
+
+- Added simple flushed progress messages, retry/rate-limit wait notices and elapsed request counts.
+- Avoided redundant full card reads when no conflict exists.
+- Reconciled legacy read-only conflicts so remote completion can update `todo-` files without deleting historical artifacts.
+- Printed conflict status, reason and artifact path as soon as a conflict is created.
+
 ## [1.0.1] - 2026-09-14
 
 ### Fixed

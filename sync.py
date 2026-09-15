@@ -79,10 +79,10 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.2"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.trello.com/1"
 METADATA_BEGIN = "<!-- syncassist:metadata"
@@ -103,6 +103,8 @@ RESERVED_WINDOWS_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+ProgressCallback = Callable[[str], None]
 
 
 class SyncAssistError(Exception):
@@ -247,12 +249,46 @@ def build_remote_projection(bundle: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _emit_progress(progress: ProgressCallback | None, message: str) -> None:
+    if progress is not None:
+        progress(f"SyncAssist: {message}")
+
+
+def _display_text(value: Any, fallback: str = "card") -> str:
+    text = " ".join(str(value or fallback).split())
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def _display_status(status: Any) -> str:
+    if status == "novo":
+        return "NOVO"
+    return "CONCLUIDO" if status == "done" else "TODO"
+
+
+def _display_conflict_reason(reason: Any) -> str:
+    return {
+        "local_and_remote_changed": "alteracoes locais e remotas diferentes",
+        "remote_changed_before_resolution": "o Trello mudou antes da resolucao",
+        "stale_resolution": "a resolucao anterior ficou obsoleta",
+        "pending_remote_operation_requires_confirmation": "ha uma operacao remota pendente",
+        "local_read_only_section_changed": "conflito antigo somente leitura",
+    }.get(str(reason), str(reason))
+
+
 class TrelloClient:
     """Small REST client; endpoint-specific methods keep payloads explicit."""
 
-    def __init__(self, config: Config | _ClientSettings, *, opener: Any | None = None):
+    def __init__(
+        self,
+        config: Config | _ClientSettings,
+        *,
+        opener: Any | None = None,
+        progress: ProgressCallback | None = None,
+    ):
         self.config = config
         self.opener = opener or urllib.request.build_opener(_SameOriginRedirectHandler())
+        self.progress = progress
+        self.request_count = 0
         self._last_request_started: float | None = None
 
     @classmethod
@@ -263,8 +299,16 @@ class TrelloClient:
         *,
         api_base: str = API_BASE,
         opener: Any | None = None,
+        progress: ProgressCallback | None = None,
     ) -> "TrelloClient":
-        return cls(_ClientSettings(api_key.strip(), token.strip(), api_base), opener=opener)
+        return cls(
+            _ClientSettings(api_key.strip(), token.strip(), api_base),
+            opener=opener,
+            progress=progress,
+        )
+
+    def _progress(self, message: str) -> None:
+        _emit_progress(self.progress, message)
 
     def _open_request(self, request: urllib.request.Request, *, timeout: int) -> Any:
         if callable(self.opener):
@@ -306,8 +350,13 @@ class TrelloClient:
             if self._last_request_started is not None:
                 wait_seconds = 0.2 - (time.monotonic() - self._last_request_started)
                 if wait_seconds > 0:
+                    if wait_seconds >= 1:
+                        self._progress(
+                            f"aguardando {wait_seconds:.1f}s entre consultas ao Trello..."
+                        )
                     time.sleep(wait_seconds)
             self._last_request_started = time.monotonic()
+            self.request_count += 1
             try:
                 with self._open_request(request, timeout=30) as response:
                     raw = response.read()
@@ -322,15 +371,26 @@ class TrelloClient:
                         wait_seconds = min(30.0, max(0.2, float(retry_after))) if retry_after else 10.0
                     except ValueError:
                         wait_seconds = 10.0
+                    self._progress(
+                        f"Trello pediu espera de {wait_seconds:.1f}s; tentando novamente..."
+                    )
                     time.sleep(wait_seconds)
                     continue
                 if status >= 500 and attempt + 1 < attempts and method.upper() in {"GET", "DELETE"}:
-                    time.sleep(2**attempt)
+                    wait_seconds = 2**attempt
+                    self._progress(
+                        f"Trello respondeu {status}; aguardando {wait_seconds}s para tentar novamente..."
+                    )
+                    time.sleep(wait_seconds)
                     continue
                 raise RemoteError(f"Trello HTTP {status} for {method.upper()} {path}", status=status) from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 if attempt + 1 < attempts and method.upper() == "GET":
-                    time.sleep(2**attempt)
+                    wait_seconds = 2**attempt
+                    self._progress(
+                        f"falha temporaria de rede; aguardando {wait_seconds}s para tentar novamente..."
+                    )
+                    time.sleep(wait_seconds)
                     continue
                 raise RemoteError(f"Trello request failed for {method.upper()} {path}: {type(exc).__name__}") from exc
 
@@ -1708,6 +1768,53 @@ def _filename_parts(filename: str) -> tuple[str, str]:
     return slug, suffix
 
 
+def _has_stale_read_only_conflict(
+    parsed: ParsedDocument,
+    remote_projection: Mapping[str, Any],
+) -> bool:
+    sync_data = parsed.metadata.get("sync") or {}
+    conflict = sync_data.get("conflict")
+    base = sync_data.get("base")
+    if (
+        not isinstance(conflict, Mapping)
+        or conflict.get("reason") != "local_read_only_section_changed"
+        or not isinstance(base, Mapping)
+        or sync_data.get("base_hash") != canonical_hash(base)
+    ):
+        return False
+    try:
+        return decide_sync(base, parsed.projection, remote_projection) != "conflict"
+    except (TypeError, ValueError):
+        return False
+
+
+def _clear_stale_read_only_conflict(
+    parsed: ParsedDocument,
+    remote_projection: Mapping[str, Any],
+    *,
+    progress: ProgressCallback | None = None,
+) -> ParsedDocument:
+    if not _has_stale_read_only_conflict(parsed, remote_projection):
+        return parsed
+    metadata = copy.deepcopy(parsed.metadata)
+    sync_data = copy.deepcopy(metadata.get("sync") or {})
+    sync_data.pop("conflict", None)
+    sync_data.pop("resolution", None)
+    metadata["sync"] = sync_data
+    _write_card_document(
+        parsed.path,
+        metadata,
+        expected_text=parsed.raw_text,
+        preserve_from=parsed,
+    )
+    _emit_progress(
+        progress,
+        f"conflito antigo somente leitura liberado em {parsed.path.name}; "
+        "o registro histórico em .conflicts foi mantido",
+    )
+    return parse_document(parsed.path, parsed.path.read_text(encoding="utf-8"))
+
+
 def _filename_plan(
     bundles: Mapping[str, Mapping[str, Any]],
     local_documents: Mapping[str, ParsedDocument] | None = None,
@@ -1723,7 +1830,7 @@ def _filename_plan(
             base = sync_data.get("base")
             if (
                 _pending_requires_review(parsed)
-                or sync_data.get("conflict")
+                or (sync_data.get("conflict") and not _has_stale_read_only_conflict(parsed, remote_projection))
                 or not isinstance(base, Mapping)
                 or sync_data.get("base_hash") != canonical_hash(base)
             ):
@@ -1947,6 +2054,7 @@ def _conflict_info(
     *,
     reason: str,
     now: str,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     card_id = str(parsed.metadata.get("trello_card_id"))
     conflict_id = canonical_hash(
@@ -1994,6 +2102,18 @@ def _conflict_info(
         metadata,
         expected_text=parsed.raw_text,
         preserve_from=parsed,
+    )
+    try:
+        artifact_name = str(artifact.relative_to(plan_dir))
+    except ValueError:
+        artifact_name = artifact.name
+    _emit_progress(
+        progress,
+        f"CONFLITO em {parsed.path.name} ({_display_text(remote_projection.get('title'))}) - "
+        f"local={_display_status(parsed.projection.get('status'))}; "
+        f"Trello={_display_status(remote_projection.get('status'))}; "
+        f"{_display_conflict_reason(reason)}. Nada foi enviado. "
+        f"Artefato: {artifact_name}",
     )
     return conflict
 
@@ -2603,7 +2723,12 @@ def _resolve_existing_conflict(
     now: str,
     report: dict[str, Any],
     bundles: Mapping[str, Mapping[str, Any]],
+    progress: ProgressCallback | None = None,
 ) -> bool:
+    sync_data = parsed.metadata.get("sync") or {}
+    conflict = sync_data.get("conflict")
+    if not conflict:
+        return False
     latest_bundle = api.get_card_bundle(str(parsed.metadata["trello_card_id"]))
     latest_projection = build_remote_projection(latest_bundle)
     if latest_projection != remote_projection:
@@ -2614,13 +2739,10 @@ def _resolve_existing_conflict(
             latest_projection,
             reason="remote_changed_before_resolution",
             now=now,
+            progress=progress,
         )
         report["conflicts"] += 1
         return True
-    sync_data = parsed.metadata.get("sync") or {}
-    conflict = sync_data.get("conflict")
-    if not conflict:
-        return False
     conflict_id = conflict.get("conflict_id") if isinstance(conflict, Mapping) else None
     if isinstance(conflict_id, str) and conflict_id:
         artifact = config.plan_dir / ".conflicts" / f"{parsed.metadata['trello_card_id']}-{conflict_id}.md"
@@ -2655,6 +2777,7 @@ def _resolve_existing_conflict(
             remote_projection,
             reason="stale_resolution",
             now=now,
+            progress=progress,
         )
         report["conflicts"] += 1
         return True
@@ -2712,6 +2835,7 @@ def _process_card(
     now: str,
     report: dict[str, Any],
     bundles: Mapping[str, Mapping[str, Any]] | None = None,
+    progress: ProgressCallback | None = None,
 ) -> None:
     card_id = _trello_id((bundle.get("card") or {}).get("id"))
     remote_projection = build_remote_projection(bundle)
@@ -2748,9 +2872,16 @@ def _process_card(
             remote_projection,
             reason="pending_remote_operation_requires_confirmation",
             now=now,
+            progress=progress,
         )
         report["conflicts"] += 1
         return
+    if _has_stale_read_only_conflict(parsed, remote_projection):
+        parsed = _clear_stale_read_only_conflict(
+            parsed,
+            remote_projection,
+            progress=progress,
+        )
     if _resolve_existing_conflict(
         api,
         config,
@@ -2761,6 +2892,7 @@ def _process_card(
         now,
         report,
         bundles or {card_id: bundle},
+        progress,
     ):
         return
     if parsed.read_only_changed:
@@ -2811,7 +2943,17 @@ def _process_card(
         latest_bundle = api.get_card_bundle(card_id)
         latest_projection = build_remote_projection(latest_bundle)
         if latest_projection != remote_projection:
-            _process_card(api, config, parsed, latest_bundle, filename, now, report, bundles)
+            _process_card(
+                api,
+                config,
+                parsed,
+                latest_bundle,
+                filename,
+                now,
+                report,
+                bundles,
+                progress,
+            )
             return
         pushed = _apply_local_changes(api, config, parsed, bundle, remote_projection, now)
         parsed_after = parse_document(parsed.path, parsed.path.read_text(encoding="utf-8"))
@@ -2837,6 +2979,7 @@ def _process_card(
             remote_projection,
             reason="local_and_remote_changed",
             now=now,
+            progress=progress,
         )
         report["conflicts"] += 1
         return
@@ -3049,11 +3192,18 @@ def _remote_card_for_missing(
     return "unknown", card
 
 
-def sync_once(config: Config, api: Any | None = None, *, now: str | None = None) -> dict[str, Any]:
+def sync_once(
+    config: Config,
+    api: Any | None = None,
+    *,
+    now: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
     """Synchronize one configured project; accepts a fake API for offline tests."""
 
+    started_at = time.monotonic()
     current_time = now or utc_now()
-    client = api or TrelloClient(config)
+    client = api or TrelloClient(config, progress=progress)
     report = _new_report()
     if config.plan_dir.exists() and not _path_is_within(config.plan_dir, config.project_root):
         raise SyncAssistError("PLAN path escapes the project root")
@@ -3061,6 +3211,7 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
         raise SyncAssistError("refusing symlinked PLAN directory")
     config.plan_dir.mkdir(parents=True, exist_ok=True)
     with SyncLock(config.plan_dir, current_time):
+        _emit_progress(progress, "validando configuracao e inventario do Trello...")
         _ensure_new_card_template(config.plan_dir)
         list_info, cards_by_id, labels_by_id = _validate_remote_scope(client, config)
         board_id = str(list_info["idBoard"])
@@ -3071,8 +3222,22 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
             board_id=board_id,
         )
         local_documents, new_documents = _load_local_documents(config.plan_dir, config, report)
+        _emit_progress(
+            progress,
+            f"inventario pronto: {len(cards_by_id)} card(s) na lista; "
+            f"{len(local_documents)} arquivo(s) local(is)",
+        )
         bundles: dict[str, Mapping[str, Any]] = {}
-        for card_id in sorted(cards_by_id):
+        card_ids = sorted(cards_by_id)
+        if card_ids:
+            _emit_progress(
+                progress,
+                f"lendo dados detalhados de {len(card_ids)} card(s); "
+                "as consultas ao Trello sao sequenciais...",
+            )
+        for index, card_id in enumerate(card_ids, start=1):
+            card_name = _display_text(cards_by_id[card_id].get("name"), card_id)
+            _emit_progress(progress, f"lendo card {index}/{len(card_ids)} - {card_name}...")
             try:
                 bundle = copy.deepcopy(client.get_card_bundle(card_id))
                 bundle["board_labels"] = copy.deepcopy(list(labels_by_id.values()))
@@ -3084,7 +3249,14 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
             except Exception as exc:  # one card must not stop independent cards
                 _report_error(report, card_id, f"remote card read failed: {type(exc).__name__}")
         created_card_ids: set[str] = set()
-        for parsed in new_documents:
+        if new_documents:
+            _emit_progress(progress, f"processando {len(new_documents)} novo(s) arquivo(s)...")
+        for index, parsed in enumerate(new_documents, start=1):
+            _emit_progress(
+                progress,
+                f"criando card novo {index}/{len(new_documents)} - "
+                f"{_display_text(parsed.projection.get('title'))}...",
+            )
             try:
                 created_card_id = _process_new_card(client, config, parsed, bundles, current_time, report)
                 if created_card_id:
@@ -3101,8 +3273,18 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
         local_documents, _ = _load_local_documents(config.plan_dir, config, report)
         filenames = _filename_plan(bundles, local_documents)
         local_documents = _stage_filename_conflicts(config.plan_dir, local_documents, filenames)
-        for card_id in sorted(bundles):
+        if bundles:
+            _emit_progress(progress, f"sincronizando {len(bundles)} card(s)...")
+        for index, card_id in enumerate(sorted(bundles), start=1):
             parsed = local_documents.get(card_id)
+            remote_projection = build_remote_projection(bundles[card_id])
+            local_status = parsed.projection.get("status") if parsed is not None else "novo"
+            _emit_progress(
+                progress,
+                f"sincronizando card {index}/{len(bundles)} - "
+                f"{_display_text((bundles[card_id].get('card') or {}).get('name'), card_id)} "
+                f"(arquivo={_display_status(local_status)}, Trello={_display_status(remote_projection.get('status'))})...",
+            )
             try:
                 _process_card(
                     client,
@@ -3113,6 +3295,7 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
                     current_time,
                     report,
                     bundles,
+                    progress,
                 )
             except ConfigError:
                 raise
@@ -3122,9 +3305,17 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
                 _report_error(report, card_id, f"card processing failed: {type(exc).__name__}")
             except Exception as exc:
                 _report_error(report, card_id, f"card processing failed: {type(exc).__name__}: {exc}")
-        for card_id, parsed in sorted(local_documents.items()):
-            if card_id in cards_by_id or card_id in created_card_ids:
-                continue
+        missing_documents = [
+            (card_id, parsed)
+            for card_id, parsed in sorted(local_documents.items())
+            if card_id not in cards_by_id and card_id not in created_card_ids
+        ]
+        if missing_documents:
+            _emit_progress(
+                progress,
+                f"verificando {len(missing_documents)} card(s) que nao apareceram no inventario...",
+            )
+        for card_id, parsed in missing_documents:
             try:
                 state, remote_card = _remote_card_for_missing(
                     client, card_id, config.list_id, board_id
@@ -3147,6 +3338,10 @@ def sync_once(config: Config, api: Any | None = None, *, now: str | None = None)
                 _report_error(report, card_id, f"card removal check failed: {type(exc).__name__}")
             except Exception as exc:
                 _report_error(report, card_id, f"card removal check failed: {type(exc).__name__}: {exc}")
+        elapsed = time.monotonic() - started_at
+        request_count = getattr(client, "request_count", None)
+        request_note = f" ({request_count} consultas ao Trello)" if isinstance(request_count, int) else ""
+        _emit_progress(progress, f"sincronizacao concluida em {elapsed:.1f}s{request_note}.")
         return report
 
 
@@ -3164,6 +3359,10 @@ def _print_report(report: Mapping[str, Any], *, output: Any = sys.stdout, errors
     for warning in report.get("warnings", []):
         card_id = warning.get("card_id") or "project"
         print(f"WARNING [{card_id}] {warning['message']}", file=errors)
+
+
+def _print_progress(message: str) -> None:
+    print(message, flush=True)
 
 
 def _exit_code(report: Mapping[str, Any]) -> int:
@@ -3195,10 +3394,14 @@ def main(argv: list[str] | None = None) -> int:
             setup_code = run_setup(project_root)
             if setup_code != 0:
                 return setup_code
+        _print_progress("SyncAssist: carregando configuracao...")
         config = Config.from_file(project_root / ".env", project_root)
+        if args.import_tasks:
+            _print_progress("SyncAssist: preparando arquivos TXT para importacao...")
         import_result = import_txt_tasks(config) if args.import_tasks else None
-        report = sync_once(config)
+        report = sync_once(config, progress=_print_progress)
         if import_result is not None:
+            _print_progress("SyncAssist: finalizando importacoes confirmadas...")
             finalize_imports(config, import_result)
             _print_import_report(import_result)
         _print_report(report)
