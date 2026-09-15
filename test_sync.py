@@ -11,11 +11,13 @@ from sync import (
     ConfigError,
     Config,
     IncompleteInventory,
+    OperationJournal,
     SCRIPT_VERSION,
     METADATA_BEGIN,
     METADATA_END,
     RemoteError,
     SCHEMA_VERSION,
+    SyncAssistError,
     TEMPLATE_FILENAME,
     TrelloClient,
     build_parser,
@@ -26,6 +28,11 @@ from sync import (
     finalize_imports,
     import_txt_tasks,
     _filename_plan,
+    _assert_safe_plan_file,
+    _load_local_documents,
+    _new_report,
+    _print_report,
+    _validate_projection_shape,
     main,
     parse_document,
     parse_board_url,
@@ -80,6 +87,11 @@ class EnvTests(unittest.TestCase):
         )
         self.assertEqual(config.plan_dir, root / "PLAN")
 
+    def test_empty_report_explicitly_says_no_changes(self):
+        output = io.StringIO()
+        _print_report({"created": 0, "updated": 0, "pushed": 0, "renamed": 0, "removed": 0, "unchanged": 0, "conflicts": 0, "failures": 0, "warnings": [], "errors": [], "examined": 0, "operations": 0, "deleted_items": 0, "deleted_checklists": 0, "recovery_paths": [], "cleanup_skipped": []}, output=output, errors=io.StringIO())
+        self.assertIn("No changes.", output.getvalue())
+
 
 class FilenameTests(unittest.TestCase):
     def test_slug_is_short_portable_and_keeps_full_title_elsewhere(self):
@@ -93,6 +105,94 @@ class FilenameTests(unittest.TestCase):
         self.assertEqual(slugify_title("![image](https://example.com/a.png)"), "card")
         self.assertIn("--", choose_filename("todo", "!!!", "abcdef1234567890abcdef12"))
         self.assertIn("--", choose_filename("todo", "CON", "abcdef1234567890abcdef12"))
+
+    def test_slug_uses_image_alt_text_and_is_utf8_bounded(self):
+        slug = slugify_title("![Release notes](https://example.com/notes.png) " + "é" * 200)
+        self.assertTrue(slug.startswith("release-notes"))
+        self.assertLessEqual(len(slug.encode("utf-8")), 180)
+
+    def test_slug_removes_html_and_data_urls(self):
+        self.assertEqual(slugify_title("<b>Ship</b> data:image/png;base64,abc"), "ship")
+
+    def test_filename_plan_disambiguates_unmanaged_occupancy(self):
+        card_id = "abcdef1234567890abcdef12"
+        bundles = {card_id: {"card": {"id": card_id, "name": "Title", "desc": "", "idLabels": []}}}
+        filenames = _filename_plan(bundles, occupied_names={"todo-title.md"})
+        self.assertEqual(filenames[card_id], "todo-title--cdef12.md")
+
+    def test_filename_plan_preserves_a_stable_suffix_after_title_change(self):
+        card_id = "abcdef1234567890abcdef12"
+        old_projection = projection(title="Old title")
+        path = Path(tempfile.mkdtemp()) / "todo-old-title--cdef12.md"
+        path.write_text(
+            render_document(
+                {
+                    "managed_by": "syncassist",
+                    "schema_version": SCHEMA_VERSION,
+                    "role": "card",
+                    "trello_card_id": card_id,
+                    "trello_board_id": "abcdef1234567890abcdef90",
+                    "trello_list_id": "abcdef1234567890abcdef34",
+                    "section_token": "abc123",
+                    "status": "todo",
+                    "filename": {"slug": "old-title", "suffix": "cdef12"},
+                    "content": old_projection,
+                    "reference": {},
+                    "sync": {"base": old_projection, "base_hash": canonical_hash(old_projection), "reference_hash": canonical_hash({})},
+                }
+            ),
+            encoding="utf-8",
+        )
+        parsed = parse_document(path, path.read_text(encoding="utf-8"))
+        bundles = {card_id: {"card": {"id": card_id, "name": "New title", "desc": "", "idLabels": []}}}
+
+        filenames = _filename_plan(bundles, {card_id: parsed})
+
+        self.assertEqual(filenames[card_id], "todo-new-title--cdef12.md")
+
+    def test_plan_path_length_is_checked_before_writes(self):
+        with self.assertRaises(SyncAssistError):
+            _assert_safe_plan_file(Path("C:/" + "a" * 270 + ".md"), Path("C:/"))
+
+    def test_unmanaged_markdown_is_ignored_even_with_a_card_like_name(self):
+        root = Path(tempfile.mkdtemp())
+        plan_dir = root / "PLAN"
+        plan_dir.mkdir()
+        plan_dir.joinpath("todo-personal.md").write_text("# Personal note\n", encoding="utf-8")
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        report = _new_report()
+
+        documents, new_documents, scan_complete = _load_local_documents(plan_dir, config, report)
+
+        self.assertEqual(documents, {})
+        self.assertEqual(new_documents, [])
+        self.assertTrue(scan_complete)
+        self.assertEqual(report["failures"], 0)
+
+    def test_projection_rejects_title_limit_and_duplicate_subtask_ids(self):
+        with self.assertRaises(ValueError):
+            _validate_projection_shape(projection(title="x" * 164))
+        duplicate = projection(
+            checklists=[
+                {
+                    "id": "abcdef1234567890abcdef90",
+                    "name": "Checklist",
+                    "items": [
+                        {"id": "abcdef1234567890abcdef91", "name": "One", "state": "incomplete"},
+                        {"id": "abcdef1234567890abcdef91", "name": "Two", "state": "incomplete"},
+                    ],
+                }
+            ]
+        )
+        with self.assertRaises(ValueError):
+            _validate_projection_shape(duplicate)
 
     def test_duplicate_uses_stable_id_only_when_needed(self):
         self.assertEqual(
@@ -323,6 +423,64 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(parsed.projection["description"], metadata["content"]["description"])
         self.assertNotEqual(parsed.metadata["section_token"], "abc123")
         self.assertEqual(document.count("<!-- syncassist:abc123:description:begin -->"), 1)
+
+    def test_current_document_requires_all_sections_in_order(self):
+        metadata = {
+            "managed_by": "syncassist",
+            "schema_version": SCHEMA_VERSION,
+            "role": "card",
+            "section_token": "abc123",
+            "content": projection(title="Title"),
+            "reference": {},
+            "sync": {"reference_hash": canonical_hash({})},
+        }
+        document = render_document(metadata)
+        token = metadata["section_token"]
+        missing_comments = document.replace(_section_marker(token, "comments", "begin") + "\n", "", 1)
+        with self.assertRaises(ValueError):
+            parse_document(Path("todo-title.md"), missing_comments)
+
+    def test_summary_renders_label_names_colors_and_ids_from_reference(self):
+        document = render_document(
+            {
+                "managed_by": "syncassist",
+                "schema_version": SCHEMA_VERSION,
+                "role": "card",
+                "section_token": "abc123",
+                "content": projection(title="Title"),
+                "reference": {
+                    "card": {"idLabels": ["abcdef1234567890abcdef56"]},
+                    "board_labels": [
+                        {"id": "abcdef1234567890abcdef56", "name": "Urgent", "color": "red"}
+                    ],
+                },
+                "sync": {"reference_hash": canonical_hash({})},
+            }
+        )
+        self.assertIn("Urgent [red] (abcdef1234567890abcdef56)", document)
+
+    def test_operation_journal_persists_base_desired_and_receipt(self):
+        base = projection(title="Base")
+        metadata = {
+            "managed_by": "syncassist",
+            "schema_version": SCHEMA_VERSION,
+            "role": "card",
+            "section_token": "abc123",
+            "content": projection(title="Local"),
+            "reference": {},
+            "sync": {"base": base, "base_hash": canonical_hash(base), "reference_hash": canonical_hash({})},
+        }
+        path = Path(tempfile.mkdtemp()) / "todo-card.md"
+        path.write_text(render_document(metadata), encoding="utf-8")
+        parsed = parse_document(path, path.read_text(encoding="utf-8"))
+        journal = OperationJournal(path, parsed, parsed.projection, "2026-09-14T00:00:00Z")
+
+        journal.run("update_card", {"card_id": "abcdef1234567890abcdef12", "name": "Local"}, lambda: {"id": "abcdef1234567890abcdef12"})
+
+        pending = parse_document(path, path.read_text(encoding="utf-8")).metadata["sync"]["pending"]
+        self.assertEqual(pending["base"], base)
+        self.assertEqual(pending["desired"], parsed.projection)
+        self.assertEqual(pending["operations"][0]["receipt"], {"id": "abcdef1234567890abcdef12"})
 
 
 class DecisionTests(unittest.TestCase):
@@ -630,6 +788,74 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(IncompleteInventory):
             TrelloClient(config, opener=opener).get_card_bundle("abcdef1234567890abcdef56")
 
+    def test_card_bundle_preserves_previous_section_after_complementary_failure(self):
+        root = Path(tempfile.mkdtemp())
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        card_id = "abcdef1234567890abcdef56"
+        previous = {"attachments": [{"id": "old-attachment"}]}
+
+        def request(method, path, **kwargs):
+            if path == f"/cards/{card_id}/attachments":
+                raise RemoteError("temporary attachment failure", status=503)
+            if path == f"/cards/{card_id}":
+                return {"id": card_id, "idBoard": "abcdef1234567890abcdef90", "idList": config.list_id}
+            if path.endswith("/checklists"):
+                return []
+            if path.endswith("/members") or path.endswith("/customFieldItems") or path.endswith("/stickers"):
+                return []
+            if path.endswith("/customFields") or path.endswith("/membersVoted") or path.endswith("/pluginData"):
+                return []
+            if path.endswith("/actions"):
+                return []
+            raise AssertionError(path)
+
+        client = TrelloClient(config)
+        client._request = request
+        bundle = client.get_card_bundle(card_id, previous_reference=previous)
+
+        self.assertEqual(bundle["attachments"], previous["attachments"])
+        self.assertEqual(bundle["resource_status"]["attachments"], "failed")
+        self.assertIn("attachments", bundle["resource_errors"])
+
+    def test_card_bundle_records_unsupported_optional_resource(self):
+        root = Path(tempfile.mkdtemp())
+        config = Config.from_values(
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+            },
+            root,
+        )
+        card_id = "abcdef1234567890abcdef56"
+
+        def request(method, path, **kwargs):
+            if path == f"/cards/{card_id}/customFieldItems":
+                raise RemoteError("custom fields unavailable", status=403)
+            if path == f"/cards/{card_id}":
+                return {"id": card_id, "idBoard": "abcdef1234567890abcdef90", "idList": config.list_id}
+            if path.endswith("/checklists") or path.endswith("/attachments") or path.endswith("/members"):
+                return []
+            if path.endswith("/stickers") or path.endswith("/actions"):
+                return []
+            if path.endswith("/customFields") or path.endswith("/membersVoted") or path.endswith("/pluginData"):
+                return []
+            raise AssertionError(path)
+
+        client = TrelloClient(config)
+        client._request = request
+        bundle = client.get_card_bundle(card_id)
+
+        self.assertEqual(bundle["custom_field_items"], [])
+        self.assertEqual(bundle["resource_status"]["custom_field_items"], "unsupported")
+
     def test_create_card_uses_the_configured_list_without_query_credentials(self):
         root = Path(tempfile.mkdtemp())
         config = Config.from_values(
@@ -695,8 +921,8 @@ class SetupTests(unittest.TestCase):
             build_parser().parse_args(["--setup", "--import"])
         self.assertEqual(context.exception.code, 2)
 
-    def test_product_version_is_one_zero_two(self):
-        self.assertEqual(SCRIPT_VERSION, "1.0.2")
+    def test_product_version_is_one_one_one(self):
+        self.assertEqual(SCRIPT_VERSION, "1.1.1")
 
     def test_main_runs_sync_after_successful_setup(self):
         config = object()
@@ -1253,14 +1479,30 @@ class SyncOnceTests(unittest.TestCase):
 
     def test_imports_a_card_into_plan(self):
         root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
         api = FakeApi(sample_bundle())
-        report = sync_once(self.make_config(root), api, now="2026-09-14T00:00:00Z")
+        report = sync_once(config, api, now="2026-09-14T00:00:00Z")
         files = plan_card_files(root)
         self.assertEqual(len(files), 1)
         parsed = parse_document(files[0], files[0].read_text(encoding="utf-8"))
         self.assertEqual(parsed.metadata["trello_card_id"], api.bundle["card"]["id"])
+        self.assertEqual(parsed.reference["list"]["id"], config.list_id)
+        self.assertEqual(parsed.reference["board"]["id"], api.board_id)
         self.assertNotIn("trello_done_label_id", parsed.metadata)
         self.assertEqual(report["created"], 1)
+
+    def test_remote_bundle_identity_mismatch_is_not_written(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        mismatched = json.loads(json.dumps(api.bundle))
+        mismatched["card"]["id"] = "1234567890abcdef12345678"
+        api.get_card_bundle = lambda card_id: mismatched
+
+        report = sync_once(config, api, now="2026-09-14T00:00:00Z")
+
+        self.assertEqual(report["failures"], 1)
+        self.assertEqual(plan_card_files(root), [])
 
     def test_import_records_the_bound_list_name(self):
         root = Path(tempfile.mkdtemp())
@@ -1380,7 +1622,32 @@ class SyncOnceTests(unittest.TestCase):
         self.assertFalse(api.label_changes)
         self.assertEqual(api.bundle["card"]["idList"], config.list_id)
         self.assertEqual(report["pushed"], 1)
+        self.assertGreaterEqual(report["operations"], 1)
         self.assertTrue((root / "PLAN" / f"done-{slugify_title('New title')}.md").exists())
+
+    def test_file_changed_during_remote_write_gets_a_review_artifact(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        metadata = parse_document(path, path.read_text(encoding="utf-8")).metadata
+        metadata["content"]["description"] = "Local update"
+        path.write_text(render_document(metadata), encoding="utf-8")
+        original_update = api.update_card
+
+        def update_and_edit_file(card_id, fields):
+            path.write_text("# External edit while request was running\n", encoding="utf-8")
+            return original_update(card_id, fields)
+
+        api.update_card = update_and_edit_file
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_text(encoding="utf-8"), "# External edit while request was running\n")
+        self.assertTrue(list((root / "PLAN" / ".conflicts").glob("*.md")))
+        self.assertEqual(report["conflicts"], 1)
 
     def test_rejects_unknown_label_in_local_editable_labels(self):
         root = Path(tempfile.mkdtemp())
@@ -1472,8 +1739,27 @@ class SyncOnceTests(unittest.TestCase):
         }
         report = sync_once(config, api, now="2026-09-14T00:01:00Z")
         self.assertEqual(report["removed"], 1)
+        self.assertEqual(len(report["recovery_paths"]), 1)
         self.assertFalse(plan_card_files(root))
         self.assertEqual(len(list((root / "PLAN" / ".removed").glob("*.md"))), 1)
+
+    def test_missing_card_with_local_edits_is_preserved_for_review(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        metadata = parse_document(path, path.read_text(encoding="utf-8")).metadata
+        metadata["content"]["description"] = "Local work that must not be discarded"
+        path.write_text(render_document(metadata), encoding="utf-8")
+        api.cards = []
+        api.get_card = lambda card_id: {**api.bundle["card"], "idList": "abcdef1234567890abcdef99"}
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertTrue(path.exists())
+        self.assertEqual(report["removed"], 0)
+        self.assertTrue(list((root / "PLAN" / ".conflicts").glob("*.md")))
 
     def test_keeps_file_when_missing_inventory_still_reports_same_list(self):
         root = Path(tempfile.mkdtemp())
@@ -1487,6 +1773,49 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(report["removed"], 0)
         self.assertGreaterEqual(report["failures"], 1)
         self.assertEqual(len(plan_card_files(root)), 1)
+
+    def test_missing_404_revalidates_scope_before_recovery(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        api.cards = []
+        calls = []
+        original_list = api.get_list
+        original_board = api.get_board
+        original_cards = api.get_board_cards
+
+        def missing_card(card_id):
+            raise RemoteError("gone", status=404)
+
+        api.get_card = missing_card
+        api.get_list = lambda list_id: (calls.append("list") or original_list(list_id))
+        api.get_board = lambda board_id: (calls.append("board") or original_board(board_id))
+        api.get_board_cards = lambda board_id: (calls.append("cards") or original_cards(board_id))
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertEqual(report["removed"], 1)
+        self.assertGreaterEqual(calls.count("list"), 2)
+        self.assertGreaterEqual(calls.count("board"), 2)
+
+    def test_corrupt_managed_file_disables_cleanup(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        card_path = next_plan_card(root)
+        (root / "PLAN" / "todo-broken.md").write_text(
+            "<!-- syncassist:metadata\nnot-json\nsyncassist:end -->\n", encoding="utf-8"
+        )
+        api.cards = []
+        api.get_card = lambda card_id: (_ for _ in ()).throw(RemoteError("gone", status=404))
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertTrue(card_path.exists())
+        self.assertEqual(report["removed"], 0)
+        self.assertTrue(report["cleanup_skipped"])
 
     def test_recreates_a_locally_deleted_file(self):
         root = Path(tempfile.mkdtemp())
@@ -1625,6 +1954,37 @@ class SyncOnceTests(unittest.TestCase):
         self.assertGreaterEqual(report["failures"], 1)
         self.assertEqual(report["pushed"], 0)
         self.assertEqual(api.bundle["checklists"][0]["checkItems"][0]["id"], item_id)
+
+    def test_explicit_checklist_and_item_deletes_are_reported(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        checklist_id = "abcdef1234567890abcdef90"
+        item_id = "abcdef1234567890abcdef91"
+        second_checklist_id = "abcdef1234567890abcdef92"
+        bundle = sample_bundle()
+        bundle["checklists"] = [
+            {"id": checklist_id, "name": "Keep", "checkItems": [{"id": item_id, "name": "Remove", "state": "incomplete"}]},
+            {"id": second_checklist_id, "name": "Delete", "checkItems": []},
+        ]
+        api = FakeApi(bundle)
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        text = path.read_text(encoding="utf-8")
+        text = text.replace(
+            f"<!-- syncassist:item={item_id} -->",
+            f"<!-- syncassist:item={item_id} delete -->",
+        ).replace(
+            f"<!-- syncassist:checklist={second_checklist_id} -->",
+            f"<!-- syncassist:checklist={second_checklist_id} delete -->",
+        )
+        path.write_text(text, encoding="utf-8")
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertEqual(report["deleted_items"], 1)
+        self.assertEqual(report["deleted_checklists"], 1)
+        self.assertEqual(api.bundle["checklists"][0]["checkItems"], [])
+        self.assertEqual(len(api.bundle["checklists"]), 1)
 
     def test_moves_an_existing_checkitem_between_checklists_by_id(self):
         root = Path(tempfile.mkdtemp())
@@ -1806,6 +2166,8 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(api.bundle["card"]["desc"], "Local description")
         self.assertEqual(report["conflicts"], 0)
         self.assertEqual(report["pushed"], 1)
+        artifact = next((root / "PLAN" / ".conflicts").glob("*.md"))
+        self.assertIn("resolved", artifact.read_text(encoding="utf-8").lower())
 
     def test_ambiguous_new_card_creation_is_reconciled_without_a_duplicate(self):
         root = Path(tempfile.mkdtemp())
@@ -1836,6 +2198,32 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(len(api.cards), 1)
         self.assertEqual(second["conflicts"], 0)
         self.assertTrue(parse_document(new_path, new_path.read_text(encoding="utf-8")).metadata["trello_card_id"])
+
+    def test_ambiguous_new_card_with_changed_local_intent_is_not_replayed(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        api.cards = []
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        template = root / "PLAN" / TEMPLATE_FILENAME
+        new_path = root / "PLAN" / "todo-people.md"
+        new_path.write_text(template.read_text(encoding="utf-8").replace("# New task", "# People", 1), encoding="utf-8")
+        original_create = api.create_card
+
+        def create_then_lose_response(*args, **kwargs):
+            original_create(*args, **kwargs)
+            raise AmbiguousOperation("lost create response")
+
+        api.create_card = create_then_lose_response
+        sync_once(config, api, now="2026-09-14T00:01:00Z")
+        new_path.write_text(new_path.read_text(encoding="utf-8").replace("# People", "# Changed", 1), encoding="utf-8")
+        api.create_card = original_create
+
+        report = sync_once(config, api, now="2026-09-14T00:02:00Z")
+
+        self.assertEqual(report["conflicts"], 1)
+        self.assertEqual(len(api.cards), 1)
+        self.assertEqual(api.bundle["card"]["name"], "People")
 
     def test_import_source_survives_card_recovery(self):
         root = Path(tempfile.mkdtemp())
@@ -1902,11 +2290,14 @@ class SyncOnceTests(unittest.TestCase):
         api.create_checklist = create_then_lose_response
         first = sync_once(config, api, now="2026-09-14T00:01:00Z")
         self.assertGreaterEqual(first["failures"], 1)
+        changed = parse_document(path, path.read_text(encoding="utf-8")).metadata
+        changed["content"]["checklists"][0]["name"] = "Changed after request"
+        path.write_text(render_document(changed), encoding="utf-8")
 
         api.create_checklist = original_create
         second = sync_once(config, api, now="2026-09-14T00:02:00Z")
 
-        self.assertEqual(second["conflicts"], 0)
+        self.assertEqual(second["conflicts"], 1)
         self.assertEqual(second["pushed"], 0)
         self.assertEqual(len(api.bundle["checklists"]), 1)
 

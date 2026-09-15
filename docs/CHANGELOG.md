@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.1.1] - 2026-09-14
+
+### Validation
+
+- Completed the authorized real-list validation on `teste/projeto1` under Windows/PowerShell, covering import, reference snapshots, edits, status, labels, checklists/items, conflicts, recovery, archival, deletion, extreme filenames and ambiguous card creation.
+- Verified cleanup of all five generated cards and the temporary workspace; Linux/macOS validation remains unavailable because those environments were not present.
+
+## [1.1.0] - 2026-09-14
+
+### Added
+
+- Added board custom-field definitions, card votes and Power-Up data to raw references when available.
+- Added per-resource status/error reporting with previous-reference retention for failed complementary reads.
+- Added UTF-8 filename bounds, unmanaged-name collision handling, reparse-point checks and duplicate-ID scan protection.
+- Added journal base/desired snapshots, operation receipts, destructive-operation counts, recovery paths and explicit no-change output.
+
+### Fixed
+
+- Enforced current Markdown section ordering while retaining one-way legacy reformatting.
+- Rendered associated label names, colors and full IDs in the read-only summary.
+- Prevented cleanup after incomplete scans, ambiguous checklist/item POSTs, changed local intent or local edits during remote writes.
+- Revalidated list/board scope before 404 recovery and preserved resolved conflict artifacts.
+- Updated documentation and offline evidence to 102 passing tests.
+
 ## [1.0.3] - 2026-09-14
 
 ### Documentation

@@ -1,171 +1,184 @@
-# PLAN.md — SyncAssist
+# SyncAssist Pending Work Implementation Plan
 
-Consolidation date: 14/09/2026. This is the residual implementation and validation plan after the current-state audit.
+> For agentic workers: use the executing-plans or subagent-driven-development workflow and track every step with checkboxes.
 
-## Current status
+**Goal:** Implement and verify every incomplete or unproven item carried over from the SyncAssist audit while preserving the one-file, standard-library product.
 
-SyncAssist runtime version 1.0.2 contains the offline implementation for one Trello list: configuration, REST transport, paginated inventory, Markdown card documents, bidirectional editable synchronization, native due-date status, labels, checklists, conflicts, recovery, locking, template-based creation and TXT import.
+**Architecture:** Keep sync.py as the portable entry point. Extend its existing layers in place: REST/resource acquisition, document parsing/rendering, filename/path safety, journaled mutation, scope cleanup, reporting and CLI. Add focused unittest cases in test_sync.py before each production change, then update the user-facing documentation.
 
-Evidence collected in this audit:
+**Tech Stack:** Python 3.11+, standard library only, urllib REST client, pathlib, argparse and unittest.
 
-- Python 3.13.7 on Windows.
-- 82 offline unittest cases passed.
-- sync.py and test_sync.py compile successfully.
-- --help and --version work without .env or network access.
-- No real Trello list was used in this audit; integration and cross-platform validation remain pending.
+**Spec:** docs/PLAN.md is the execution plan; the previous audited requirements are represented by Tasks 1–6 below.
 
-The completed items were removed from the active checklist below. Remaining checkboxes are incomplete implementation work, missing test evidence or real Trello validation. This document does not authorize production-card experiments or commits.
+## Global constraints
 
-## 1. Scope retained
+- Keep runtime compatibility with Python 3.11 or newer.
+- Do not add dependencies, a Trello SDK, a database, a daemon, a scheduler, a webhook, a GUI or a custom API.
+- Keep the fixed Trello HTTPS origin, OAuth header, bounded retries and redacted diagnostics.
+- Keep full Trello IDs as identity; filenames remain presentation/status input only.
+- Never infer completion from labels, titles, checklist completion or archiving; use dueComplete.
+- Never delete, move or archive a Trello card because a local file is absent.
+- Never repeat an uncertain POST automatically; reconcile by identity or preserve an explicit conflict.
+- Preserve local bytes and remote receipts across partial failures.
+- Do not commit changes.
 
-| Topic | Decision |
-| --- | --- |
-| Technology | Python 3.11+ and standard library only. |
-| Distribution | One portable sync.py per project, with local .env configuration. |
-| Binding | TRELLO_LIST_ID identifies the project list; names never determine identity. |
-| Direction | Bidirectional for title, description, checklists, label associations and completion status. |
-| Identity | Full Trello IDs live in the Markdown technical metadata. |
-| Local state | Base snapshot, hashes, pending operations and conflicts live in the card document. |
-| Status | todo-/done- maps to Trello dueComplete; cards never move to represent status. |
-| Creation | Only an explicit copy of PLAN/_modelo-card.md or a valid --import source creates a card. |
-| Removal | A missing local file never deletes a card. Cards leaving scope are moved to PLAN/.removed/ after the required checks. |
-| Conflicts | Divergent local and remote edits preserve base/local/remote and require an explicit resolution. |
-| Security | .env stays outside Git; paths, IDs and remote text are untrusted; logs exclude credentials and card bodies. |
+## Evidence baseline
 
-The reference scale of approximately 200 cards is not a product limit. A hash detects inconsistency/change only; it is not a cryptographic authenticity signature.
+Before implementation, the current repository has 82 passing offline tests, successful py_compile, and working --help/--version. No real Trello list has been used. Existing tests and helpers must be reused; no second parser, client or report model may be introduced.
 
-The MVP remains manual and non-interactive during normal synchronization. It does not add a daemon, scheduler, webhook, GUI, dashboard, custom API, database, SDK, packager, dry-run mode or automatic line-level merge. It does not edit comments, members, dates, attachments, covers, votes, custom fields or Power-Up data remotely, and never downloads binaries or visits URLs from card content.
+---
 
-## 2. Current implementation baseline
+### Task 1: Complete remote resource acquisition
 
-The following baseline is already implemented and documented in README.md and the tests, so it is no longer repeated as a pending task:
+**Files**
 
-- Copy-based installation, .env parsing and validation, root resolution and board/list binding.
-- Standard-library Trello client with HTTPS origin pinning, OAuth header, timeout, bounded retry, rate-limit spacing and redacted errors.
-- Complete board-card inventory with filtering by list, archived-card coverage, deduplication and paginated board labels/actions.
-- Markdown v1 layout with stable card identity, editable title/description/checklists/labels/status, read-only reference data, safe metadata serialization and legacy reformatting.
-- Three-way synchronization, semantic hashes, idempotent unchanged runs and remote rereads before writes.
-- Checklist/item identity, reordering, moves, explicit item/checklist deletion markers, temporary IDs and pending operation journaling.
-- Portable slug generation, deterministic collision suffixes, title preservation, global rename planning and swap staging.
-- Native due-date completion, ordinary label association, explicit template creation and idempotent TXT import.
-- Conflict artifacts and versioned resolution, recoverable removals, local-file recreation, lock handling, atomic writes and credential-free reporting.
+- Modify: sync.py, TrelloClient resource methods and sync_once inventory flow.
+- Test: test_sync.py, ClientTests and SyncOnceTests.
+- Update: docs/README.md with fetched/unsupported resource behavior.
 
-## 3. Remaining implementation work
+**Interfaces**
 
-### 3.1 Remote completeness and failure semantics
+- Keep TrelloClient.get_card_bundle(card_id, previous_reference=None) returning the existing bundle shape plus resource_status and resource_errors.
+- Keep incomplete bundles non-writable.
+- Preserve current fake APIs by using a small adapter in sync_once when an injected fake does not accept previous_reference.
 
-- [ ] Import custom-field definitions together with custom-field values when the board and token expose them.
-- [ ] Import votes and shared Power-Up data when exposed, or record their explicit unavailability instead of implying a complete snapshot.
-- [ ] Fetch every page of every resource that exposes pagination, not only the currently covered board-label and action cursors.
-- [ ] Preserve already collected reference sections when a complementary request fails, while marking the card collection incomplete.
-- [ ] Distinguish an explicitly unsupported resource from a transient failure in the reference snapshot and report both states clearly.
-- [ ] Confirm remote state with GET before repeating an uncertain update, label association or sub-item deletion.
+- [x] Add failing tests for partial complementary-resource failure, explicit unsupported resources and pagination of every resource that exposes a cursor.
+- [x] Add resource loading that records status per resource: complete, empty, unsupported or failed; never map a failed request to [].
+- [x] Pass the prior parsed reference when available and retain prior sections when the new request fails.
+- [x] Keep card/list/board/labels/actions/checklists/attachments/members/custom-field values/stickers in the raw reference snapshot.
+- [x] Add custom-field definitions, votes and Power-Up shared data only when their official endpoint and response are available; otherwise preserve an explicit unsupported entry.
+- [x] Preserve board-label and action pagination with cursor advancement and repeated-cursor protection; apply the same helper only to endpoints whose contract supports pagination.
+- [x] Set cleanup_allowed false whenever a resource or inventory cannot be complete, but continue independent cards.
+- [x] Run focused ClientTests/SyncOnceTests, then the complete offline suite.
 
-### 3.2 Document validation and readable reference data
+### Task 2: Harden document contract and readable labels
 
-- [ ] Require every generated/read section exactly once and in the defined order; reject missing, repeated, out-of-order or truncated markers before any mutation.
-- [ ] Validate all metadata types, required values, checklist/item ID uniqueness and base_hash integrity before comparing versions.
-- [ ] Prevent a manually edited card ID from authorizing writes to another card; validate card ownership and the configured board/list before every write.
-- [ ] Display each associated label with name, color and ID while keeping content.label_ids as the only editable association input.
-- [ ] Keep title and description as single editable sources rather than allowing competing editable copies in the technical block.
+**Files**
 
-### 3.3 Filename and filesystem edge cases
+- Modify: sync.py, parse_document, metadata validation and summary rendering.
+- Test: test_sync.py, DocumentTests and SyncOnceTests.
+- Update: docs/README.md and the generated-format section of this plan.
 
-- [ ] Enforce both the 60-character slug limit and the 180-byte UTF-8 limit at character boundaries.
-- [ ] Handle Windows reserved names and extension variants exactly as specified, including the card- fallback for useful text.
-- [ ] Validate total target-path length and preserve the original document when the filesystem rejects the destination.
-- [ ] Use image alt text for simple Markdown images; remove data URIs and HTML tags from slug input without querying URLs.
-- [ ] Keep the limited Markdown slug heuristic documented and add the planned ponytail comment if the heuristic remains intentionally non-parsing.
-- [ ] Treat unmanaged files as occupied names, resolve safe collisions where possible and block every duplicate-ID file together rather than accepting one.
-- [ ] Reject PLAN and control folders/files implemented as unsafe symlinks, junctions or reparse points outside the project.
+**Interfaces**
 
-### 3.4 Remote writes, resumption and local integrity
+- Keep parse_document(path, text) -> ParsedDocument.
+- Keep render_document(metadata) -> str.
+- Add private validators only; do not expose a new schema or duplicate editable fields.
 
-- [ ] Validate non-empty titles against the API's current limits without truncating the Trello title.
-- [ ] Keep explicitly marked deletions last and report destructive sub-item operation counts separately from card counts.
-- [ ] Rebuild expected remote state from the base and confirmed operations before resuming; validate pending operation types, IDs, scope and desired projections.
-- [ ] Handle local intent changes while pending without mixing batches silently; preserve both states for review.
-- [ ] When a local file changes after a remote write, persist the response/receipt in a conflict while preserving the external edit.
-- [ ] Preserve a recoverable complete document during renames, block duplicate IDs after interrupted swaps and cover full-disk, permission, open-file and invalid-path failures.
-- [ ] Retain a resolved conflict artifact as an inactive record containing the decision and date.
+- [x] Add failing tests for missing, repeated, out-of-order and truncated current-format regions, invalid metadata types, invalid base hashes, duplicate checklist/item IDs and mismatched reference identity.
+- [x] Require the current format's sections exactly once and in order before mutation; continue to parse the known legacy format only for one-way reformatting.
+- [x] Validate content, status, labels, checklists, items, base and hashes before three-way comparison.
+- [x] Require the remote card ID, board ID and list ID to match the managed document and current configured scope before a write.
+- [x] Keep visible title/description/checklists as the local editable sources; treat technical content snapshots as synchronization data only.
+- [x] Render associated labels with name, color and full ID from board_labels, and explain content.label_ids as the edit input.
+- [x] Add explicit checklist-heading deletion coverage; deletion must remain after item operations and appear in the report.
+- [x] Add the hash warning: hashes detect changes/inconsistency and do not prove authenticity.
+- [x] Run focused parser/validation tests and the full offline suite.
 
-### 3.5 Scope, removals and orchestration
+### Task 3: Make filenames and paths portable and collision-safe
 
-- [ ] Stop before any mutation when a managed file has a divergent board/list binding; do not continue with unrelated mutations in that run.
-- [ ] Disable cleanup whenever local scanning is incomplete or corrupted, while still processing cards with unambiguous identity.
-- [ ] Before removing after a 404, reconfirm list/board access and obtain a second complete inventory; cancel cleanup after any global post-inventory failure.
-- [ ] For removals with local edits, conflicts or pending operations, create the related review information, return 1 and report the recovery path.
-- [ ] Ignore unmanaged Markdown even when its filename starts with todo- or done-, and never overwrite it to satisfy a generated filename.
-- [ ] Report explicit no-change runs and distinguish examined cards, card-level results and individual remote operations.
+**Files**
 
-### 3.6 Documentation and distribution gaps
+- Modify: sync.py, slugify_title, choose_filename, _filename_plan, _assert_safe_plan_file and local scanning.
+- Test: test_sync.py, FilenameTests and SyncOnceTests.
+- Update: docs/README.md with the heuristic and limits.
 
-- [ ] Add a complete parseable fictional card example, including technical metadata and test-derived hashes.
-- [ ] Add edit examples for title, description, ordinary labels, status, checklist/item creation and explicit checklist/item deletion.
-- [ ] Document recovery after ambiguous operations, .removed backups, stale locks, interrupted renames and duplicate IDs.
-- [ ] Document the difference between network failure, missing card, moved card and archived card.
-- [ ] State that hashes detect change/inconsistency but do not prove authenticity, and document stdout/stderr usage without permanent logs.
+**Interfaces**
 
-## 4. Offline validation still pending
+- Keep slugify_title(title) -> str and choose_filename(status, title, card_id, ...).
+- Extend _filename_plan with optional occupied_names while preserving existing callers.
+- Keep generated names limited to todo-/done- plus a safe slug and optional deterministic ID suffix.
 
-The current suite proves the main happy paths and several safety cases, but it does not yet prove all requirements in the sections above.
+- [x] Add failing tests for UTF-8 byte truncation, reserved names/variants, full-path limits, image alt text, HTML/data URI removal, unmanaged collisions and duplicate managed IDs.
+- [x] Normalize with NFKC, preserve Unicode letters/numbers, sanitize forbidden characters and truncate by both characters and UTF-8 bytes at character boundaries.
+- [x] Use the image alt text for simple images, link text for simple links, and a safe card-ID fallback for media-only titles; never query a URL.
+- [x] Add the intentional ponytail comment for the limited non-parser Markdown heuristic.
+- [x] Validate target path length and reparse-point/junction safety before reads, writes, staging or recovery moves.
+- [x] Treat all immediate PLAN Markdown names as occupied, ignore unmanaged Markdown as cards, disambiguate generated names safely and block every duplicate-ID document.
+- [x] Preserve suffixes across status changes, card disappearance and title changes; keep global swap staging.
+- [x] Run focused filename/path tests and the full offline suite.
 
-- [ ] Cover full configuration isolation: missing .env, empty values, invalid credentials, root resolution from another working directory and divergent binding with zero writes.
-- [ ] Cover all filesystem naming cases: UTF-8 byte truncation, reserved variants, path-length failure, HTML/data URI input, image alt text, unmanaged collisions and duplicate IDs.
-- [ ] Cover strict document structure: invalid JSON, unknown schema, repeated/missing/out-of-order/truncated regions and all metadata/checklist validation failures.
-- [ ] Cover every B/L/R decision branch, title-edit filename update, slug-only rename behavior and all label/status combinations.
-- [ ] Cover HTTP 400, 401, 403, 404, 429, 5xx, invalid JSON and timeout classification, including global failure after partial work.
-- [ ] Cover failed complementary resources, explicit unsupported resources and archived cards still belonging to the list.
-- [ ] Cover a valid empty list and verify that it is not confused with an incomplete inventory.
-- [ ] Cover pending replay, uncertain repeatable mutations, second-operation failure, local edits during HTTP, disk/permission failures and interrupted renames.
-- [ ] Cover absent-card removal after two inventories, pending/conflicted removals, unsafe reparse points, unmanaged todo-/done- files and returning cards.
-- [ ] Cover report metrics, destructive operation reporting and the absence of credentials/card bodies in every diagnostic path.
+### Task 4: Make journal replay, writes and removals recoverable
 
-Expected offline command:
+**Files**
 
-    python -m unittest -v test_sync.py
+- Modify: sync.py, OperationJournal, pending reconciliation, conflict resolution, removal flow and reporting.
+- Test: test_sync.py, SyncOnceTests, ClientTests and new failure-injection cases.
+- Update: docs/README.md with pending, recovery and removal procedures.
 
-## 5. Real Trello validation pending
+**Interfaces**
 
-Run only against a disposable list designated by the owner, with credentials stored locally.
+- Keep OperationJournal as the per-card journal; extend its pending record with base, desired projection and operation receipts.
+- Keep sync_once(config, api=None, now=None, progress=None) -> report.
+- Extend the report with examined, operations, deleted_items, deleted_checklists, recovery_paths and cleanup_skipped without removing existing keys.
 
-- [ ] Import a card containing description, two checklists, labels, comment, attachment and dates; compare the raw/reference snapshot.
-- [ ] Create a card from a copied template and confirm the remote ID, file conversion and template preservation.
-- [ ] Change title/description remotely and locally and verify both directions.
-- [ ] Check/uncheck items, create checklist/items, move an item and explicitly delete test objects.
-- [ ] Associate/disassociate an ordinary label without changing its board name or color.
-- [ ] Rename todo- to done- and back; verify dueComplete and no list movement.
-- [ ] Check/uncheck the native due-date checkbox in Trello; verify status is independent of labels and archiving.
-- [ ] Exercise repeated, very long, Unicode, image, URL, reserved-name and collision titles.
-- [ ] Create divergent local/remote edits and resolve local, remote and merged choices, including an obsolete remote hash.
-- [ ] Delete a local file and verify recreation without a Trello DELETE.
-- [ ] Move a test card to another list and verify recoverable removal from the original project.
-- [ ] Archive a card that remains in the configured list and verify it remains represented.
-- [ ] Permanently delete only a disposable test card and verify the absence/recovery behavior.
-- [ ] Run again without changes and verify no unnecessary Trello writes or Markdown rewrites.
-- [ ] Record the systems actually tested; do not claim portability from code review alone.
+- [x] Add failing tests for title limits, uncertain repeatable mutations, pending replay, changed local intent, local edits during HTTP, second-operation failure, disk/permission failures and interrupted rename.
+- [x] Validate pending records against an allowlist, card scope, IDs, base and desired projection before using them.
+- [x] Rebuild expected remote state from base plus confirmed operations; confirm observable update/label/delete results through GET and never match checklist/item creations by name alone.
+- [x] Detect local intent changes while pending and preserve both states in a conflict.
+- [x] Persist remote receipts when a file changes during HTTP, preserving the external file and preventing a false synchronized state.
+- [x] Validate non-empty card titles against the Trello limit without truncation.
+- [x] Count card results separately from remote operations and explicitly count destructive checklist/item operations.
+- [x] Preserve resolved conflict artifacts with choice/date metadata.
+- [x] Before a 404 removal, revalidate list/board access and perform a second complete inventory; cancel cleanup on global failures.
+- [x] Create review artifacts for removals with local edits, conflicts or pending operations; preserve the original bytes and report the recovery path.
+- [x] Keep .removed recoverable, do not purge it, and never overwrite unmanaged files.
+- [x] Print an explicit no-change result, use stdout for summaries and stderr for errors, and keep credentials/card bodies out of output.
+- [x] Run focused journal/removal/report tests and the full offline suite.
 
-## 6. Completion acceptance
+### Task 5: Complete orchestration, security documentation and CLI evidence
 
-- [ ] Every remaining implementation item is completed or explicitly accepted as a documented limitation.
-- [ ] Offline tests cover conflict, removal, partial-failure, pending-operation and filesystem-integrity behavior.
-- [ ] README matches the parser and documents the actual runtime behavior and limitations.
-- [ ] Runtime version 1.0.2 and schema_version 1 remain consistent.
-- [ ] A real Trello test list has been validated, or the pending status is retained explicitly.
-- [ ] Windows, Linux and macOS results are recorded only when actually run.
-- [ ] No commit is created without explicit authorization.
+**Files**
 
-## 7. Execution record
+- Modify: sync.py orchestration, local scan and report/CLI output.
+- Test: test_sync.py, setup/CLI/security/removal coverage.
+- Update: docs/README.md, docs/CHANGELOG.md and this plan.
 
-| Area | Date | Result | Evidence | Pending |
+**Interfaces**
+
+- Keep argparse as the only CLI parser and preserve --setup/--import mutual exclusion.
+- Keep normal sync non-interactive; --setup remains the deliberate interactive configuration exception.
+- Keep exit codes 0/1/2/3 as currently documented.
+
+- [x] Add failing tests for divergent binding stopping all mutations, corrupt scan disabling cleanup, global authentication priority after partial work and untrusted diagnostics.
+- [x] Parse CLI flags before reading .env; preserve network-free --help and --version.
+- [x] Stop before mutations for divergent board/list bindings; on other scan errors process only unambiguous identities and disable cleanup.
+- [x] Continue independent cards while prioritizing global authentication failure and returning the documented code.
+- [x] Report examined cards, created/recreated, updated, renamed, removed, pushed, unchanged, conflicts, failures, operations and recovery paths.
+- [x] Verify no browser/credential prompt occurs during normal sync, no speculative CLI option is added and conflict resolution stays in the file.
+- [x] Document private-data/Git behavior, token scope, untrusted card instructions, output streams and current resource limitations.
+- [x] Keep .env.example, .gitignore and README aligned without removing already-versioned files.
+- [x] Run CLI, security and complete offline tests.
+
+### Task 6: Real-list and cross-platform validation
+
+**Files**
+
+- Update: docs/README.md and this plan's execution record only.
+- Test: disposable Trello list designated by the owner; no production cards.
+
+- [x] Run the complete import/reference snapshot scenario, including archived cards, comments, attachments, labels, dates and checklists.
+- [x] Run template creation, local/remote edits, status changes, labels, checklist/item creation/move/deletion and conflict resolutions.
+- [x] Run local deletion, moved-card recovery, archived-in-list behavior, permanent deletion of one disposable card and unchanged rerun.
+- [x] Run extreme title/filename and ambiguous-operation scenarios.
+- [x] Record actual results for available environments: Windows/PowerShell passed; no Linux distribution or macOS host was available in this workspace.
+
+## Verification gates
+
+- [x] After each task, run its focused tests and then python -m unittest -v test_sync.py.
+- [x] Before completion, run py_compile, --help, --version, git diff --check and the complete test suite from the final worktree.
+- [x] Inspect the final diff to confirm that only requested source/tests/documentation changed and no credentials or generated private data were added.
+- [x] Reconcile every checkbox in this plan against command output or real-list evidence; all planned items are now evidenced.
+- [x] Bump the runtime SemVer for behavior changes and record the same release in CHANGELOG.md.
+
+## Execution record
+
+| Task | Date | Result | Evidence | Pending |
 | --- | --- | --- | --- | --- |
-| Runtime baseline | 14/09/2026 | Implemented | sync.py, .env.example, .gitignore, docs/README.md | Residual items in section 3 |
-| Offline tests | 14/09/2026 | 82 passed | python -m unittest -v test_sync.py | Expand coverage in section 4 |
-| Syntax | 14/09/2026 | Passed | python -m py_compile sync.py test_sync.py | — |
-| CLI | 14/09/2026 | Passed | python sync.py --help; python sync.py --version | — |
-| Trello integration | 14/09/2026 | Not run | Requires owner-designated test list and local credentials | Section 5 |
-| Windows | 14/09/2026 | Offline validation only | PowerShell and Python 3.13.7 | Real-list validation |
-| Linux | — | Not validated | — | Run offline and real-list checks |
-| macOS | — | Not validated | — | Run offline and real-list checks |
-
-The current implementation is suitable for controlled Trello validation, not for claiming complete requirement coverage. Keep the residual items visible until their implementation or evidence exists.
+| Baseline audit | 14/09/2026 | 82 offline tests passed | python -m unittest -q test_sync.py; py_compile; CLI checks | All tasks below |
+| Task 1 | 14/09/2026 | Complete offline and real-list verified | 102-test suite plus disposable-list resource snapshot | None for the available target |
+| Task 2 | 14/09/2026 | Complete offline and real-list verified | strict parser, identity, labels, deletion and reference snapshot tests | None for the available target |
+| Task 3 | 14/09/2026 | Complete offline and Windows verified | filename/path, unmanaged, suffix and extreme-title scenario | Linux/macOS unavailable |
+| Task 4 | 14/09/2026 | Complete offline and real-list verified | journal, pending, conflict, recovery, deletion and report scenarios | None for the available target |
+| Task 5 | 14/09/2026 | Complete offline | CLI/security/output tests and documentation | None offline |
+| Task 6 | 14/09/2026 | Complete on authorized disposable list | Windows/PowerShell real run; 1,891 requests; 5 generated cards cleaned; all five Task 6 scenarios passed | Linux/macOS unavailable |

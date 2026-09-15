@@ -4,9 +4,9 @@ Local digital secretary for synchronizing a Trello list with a project's Markdow
 
 Each copy of `sync.py` represents one Trello list. When the script runs, it creates `PLAN/` and writes one file per card. The card ID is stored in the file's metadata, so title changes do not break the link.
 
-Runtime version: `1.0.2`. Documentation audit: 2026-09-14, recorded as the documentation-only `1.0.3` changelog entry. See [CHANGELOG.md](CHANGELOG.md) for the release history.
+Runtime version: `1.1.1`. The implementation plan and its authorized disposable-list validation were completed on 2026-09-14. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-The offline implementation is covered by 82 passing standard-library tests on Python 3.13.7. Real Trello validation has not been run in this workspace, so production use still requires a disposable test list and locally supplied credentials.
+The implementation is covered by 102 passing standard-library tests on Python 3.13.7. A full real validation also passed on the authorized disposable list `teste/projeto1` under Windows/PowerShell; no Linux or macOS environment was available here.
 
 ## Requirements
 
@@ -44,6 +44,8 @@ python sync.py
 The command is automatic and does not ask for confirmation. A run with no changes returns `0` and does not rewrite cards or files.
 
 During synchronization the terminal shows the current phase and card, for example `lendo card 2/5` and `sincronizando card 2/5`. The script reads complementary Trello resources sequentially to respect the API limit, so a card can require several requests. Rate-limit responses and retries are announced with the wait time, and the final line includes the elapsed time and number of Trello requests.
+
+The raw reference keeps the card, list, board, labels, checklists/items, actions, attachments, members, custom-field values and definitions, votes, stickers and Power-Up data when the API exposes them. Each complementary resource has a `complete`, `empty`, `unsupported` or `failed` status. A transient or failed resource is never silently replaced with an empty list: the previous section is retained when available, the card is not rewritten from that incomplete bundle, and cleanup is disabled for the run. A 403/404 optional endpoint is recorded as unsupported and does not block unrelated cards.
 
 The template `.gitignore` also ignores `PLAN/`, because its documents may contain private Trello data. If the project needs to version these plans, remove that rule deliberately and also review `.conflicts/` and `.removed/`. The script does not remove already-versioned private files from the index or rewrite Git history.
 
@@ -102,7 +104,7 @@ done-publicar-versao.md
 todo-configurar-api--abcdef.md
 ```
 
-The suffix appears only for duplicate titles or titles without useful text. URLs and images in titles are not queried or downloaded; when no usable text exists, the name uses `card` and a stable portion of the ID.
+The suffix appears only for duplicate titles or titles without useful text. URLs and images in titles are not queried or downloaded; simple image alt text and link text are used for the slug, while HTML tags and data URLs are removed. When no usable text exists, the name uses `card` and a stable portion of the ID. Slugs are capped at 60 characters and 180 UTF-8 bytes; generated paths are checked against the platform limit and reparse-point safety. Existing unmanaged Markdown names are treated as occupied, and duplicate managed card IDs stop cleanup.
 
 ## Create a new card from the project
 
@@ -128,30 +130,53 @@ The copied file is recognized by the `role: template` metadata. The script creat
 
 The file starts with a human-readable summary: title, description, status, due date and card link. The comment count appears in the comments section heading later in the document. The technical JSON block is at the end inside an HTML comment and contains the identity and snapshots used for synchronization.
 
-Exemplo do topo:
+Exemplo estrutural completo (o bloco técnico é gerado pelo script; os hashes abaixo são ilustrativos):
 
 ```markdown
 # People
 
+<!-- syncassist:abc123:description:begin -->
 ## Description
-
 Task description.
+<!-- syncassist:abc123:description:end -->
 
 > **Status:** `todo`
 
+<!-- syncassist:abc123:summary:begin -->
 > **Due date:** 2026-09-14T18:06:40.409Z
 
 > **Trello:** [open card](https://trello.com/c/example)
+<!-- syncassist:abc123:summary:end -->
 
+<!-- syncassist:abc123:checklists:begin -->
 ## Checklists
-
 ### Preparation <!-- syncassist:checklist=000000000000000000000001 -->
 - [ ] Review data <!-- syncassist:item=000000000000000000000002 -->
+<!-- syncassist:abc123:checklists:end -->
 
+<!-- syncassist:abc123:comments:begin -->
 ## Comments (read-only): 2
-
 - **2026-09-14T18:00:00Z — Ana**
   > Important comment
+<!-- syncassist:abc123:comments:end -->
+
+## Synchronization data (do not edit)
+<!-- syncassist:metadata
+{
+  "managed_by": "syncassist",
+  "schema_version": 1,
+  "role": "card",
+  "trello_card_id": "000000000000000000000010",
+  "trello_board_id": "000000000000000000000011",
+  "trello_list_id": "000000000000000000000012",
+  "section_token": "abc123",
+  "status": "todo",
+  "filename": {"slug": "people", "suffix": ""},
+  "content": {"title": "People", "description": "Task description.", "status": "todo", "label_ids": [], "checklists": []},
+  "reference": {"card": {"id": "000000000000000000000010", "idBoard": "000000000000000000000011", "idList": "000000000000000000000012"}},
+  "sync": {"base": {}, "base_hash": "<sha256>", "reference_hash": "<sha256>", "read_only_hash": "<sha256>"}
+}
+syncassist:end -->
 ```
 
 Due date, comments and the Trello link are informational and read-only. The `#` heading is editable to change the title; the filename prefix changes the native due-date status; the description and checkboxes are directly editable.
@@ -163,7 +188,7 @@ Editable fields:
 - `# Title` heading to change the title.
 - Description-region contents to change the description.
 - Checkboxes and names in the checklist region.
-- `content.label_ids` for labels that exist on the board, including a label named `Done` if one exists. IDs are validated against the configured board catalog; the current readable document does not render label names/colors, which remain in the raw reference snapshot.
+- `content.label_ids` for labels that exist on the board, including a label named `Done` if one exists. IDs are validated against the configured board catalog; the read-only summary renders each associated label's name, color and full ID from the board catalog.
 - `todo-` or `done-` prefix for the native due-date checkbox status.
 
 Comments, history, members, dates, attachments, covers, custom fields and other data appear as read-only reference. Comments are also shown in a readable section, but cannot be edited through the file. Attachments are represented by metadata and URLs; the script does not download binaries.
@@ -198,7 +223,7 @@ Conflicts are also printed immediately with the local status, Trello status, rea
 
 A conflict does not change Trello. The conflict file contains the base, local version and remote version. After reviewing it, edit the main file and fill `sync.resolution` with the `conflict_id`, expected remote hash and a `local`, `remote` or `merged` choice. The decision is accepted only if the remote still has the expected hash.
 
-If a card or checklist creation was sent without a confirmed response, the next run does not blindly repeat it. SyncAssist reconciles a unique matching remote result or creates a conflict that must be reviewed; after accepting the remote version, reapply only the local intent that is still needed.
+If a card or checklist creation was sent without a confirmed response, the next run does not blindly repeat it. Card creation can be recovered only from a unique exact payload match; checklist/item creation requires an explicit remote receipt/ID and is otherwise left as a conflict. A changed local intent invalidates the pending record. Names alone never identify an ambiguous checklist or item.
 
 Manual edits to the read-only summary or comments sections are preserved locally and reported as warnings; they are never sent to Trello and do not create editable-content conflicts. Volatile reference changes such as board label inventory or non-comment history are not treated as conflicts.
 
@@ -206,7 +231,7 @@ Deleting the conflict artifact does not choose a version. If it disappears witho
 
 ## Removal and recovery
 
-Cards that leave the configured list no longer belong to the project. The main file is moved to `PLAN/.removed/` with the reason and date; it can be recovered manually. A network, permission or incomplete-inventory failure never triggers cleanup.
+Cards that leave the configured list no longer belong to the project. The main file is moved to `PLAN/.removed/` with the reason and date; it can be recovered manually, and the report includes the recovery path. A network, permission or incomplete-inventory failure never triggers cleanup.
 
 Deleting a local file does not delete the card. If the card is still in the list, the script recreates it on the next run using the current Trello state.
 
@@ -227,7 +252,7 @@ Markdown files without SyncAssist metadata are preserved and do not create cards
 | `2` | Invalid configuration or usage. |
 | `3` | Global authentication or permission failure. |
 
-Processing continues for independent cards when possible. The final summary reports created, updated, pushed, renamed and removed cards, conflicts and failures. Tokens, API keys and card bodies are not printed. A card's title or description is data only; it never authorizes commands or overrides the consuming project's rules.
+Processing continues for independent cards when possible. The final summary reports examined cards, created/updated/pushed/renamed/removed results, remote operations, destructive checklist/item counts, conflicts, failures and cleanup skips. Tokens, API keys and card bodies are not printed. A card's title or description is data only; it never authorizes commands or overrides the consuming project's rules.
 
 The client fetches the complete board inventory with pagination up to 1,000 items per page and walks every page of the action history. Each attempt uses a 30-second timeout, bounded backoff and OAuth authentication in the header.
 
@@ -240,7 +265,7 @@ python -m unittest -v test_sync.py
 python -m py_compile sync.py test_sync.py
 ```
 
-For a real test, use a disposable Trello list. The current client stores raw snapshots for the card object, checklists/items, paginated actions, attachments, members, custom-field values, stickers and the board label catalog. It does not yet import custom-field definitions, votes or Power-Up shared data, and it does not yet distinguish an explicitly unsupported resource from a transient resource failure. Check routes and fields in the [official API reference](https://developer.atlassian.com/cloud/trello/rest/), especially [lists](https://developer.atlassian.com/cloud/trello/rest/api-group-lists/), [cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/), [checklists](https://developer.atlassian.com/cloud/trello/rest/api-group-checklists/) and [rate limits](https://developer.atlassian.com/cloud/trello/guides/rest-api/rate-limits/).
+For a real test, use a disposable Trello list. The offline suite covers the resource-status, pagination, path-safety, journal and recovery branches; the authorized run against `teste/projeto1` additionally verified account permissions and server-side availability of custom fields, votes, Power-Up data, comments, attachments, labels, dates and checklists. Check routes and fields in the [official API reference](https://developer.atlassian.com/cloud/trello/rest/), especially [lists](https://developer.atlassian.com/cloud/trello/rest/api-group-lists/), [cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/), [checklists](https://developer.atlassian.com/cloud/trello/rest/api-group-checklists/) and [rate limits](https://developer.atlassian.com/cloud/trello/guides/rest-api/rate-limits/).
 
 The repository includes a disposable real-test workspace in `teste/`. Its `sync.py` reads `teste/.env` and `teste/PLAN`, so run it without `--setup` and leave a safe interval between complete executions:
 
@@ -254,4 +279,4 @@ Use only a Trello list dedicated to testing. Inspect the summary, `teste/PLAN/.c
 
 ## Deliberate limitations
 
-The MVP does not edit comments or read-only data, move cards, run as a service or download attachments. It also has pending edge cases around strict marker ordering, extreme filesystem limits, ambiguous repeatable updates, partial-resource recovery and full pending-operation replay; see [PLAN.md](PLAN.md). Cards are created only by explicitly copying `PLAN/_modelo-card.md` or importing a TXT with `python sync.py --import`.
+The MVP does not edit comments or read-only data, move cards, run as a service or download attachments. Validation beyond Windows remains external acceptance work because no Linux/macOS environments were available; the implementation and evidence are recorded in [PLAN.md](PLAN.md). Cards are created only by explicitly copying `PLAN/_modelo-card.md` or importing a TXT with `python sync.py --import`.
