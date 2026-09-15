@@ -921,6 +921,18 @@ class SetupTests(unittest.TestCase):
             build_parser().parse_args(["--setup", "--import"])
         self.assertEqual(context.exception.code, 2)
 
+    def test_parser_help_documents_cli_operations_and_contract(self):
+        help_text = build_parser().format_help()
+        for expected in (
+            "python sync.py --setup",
+            "python sync.py --import",
+            "python sync.py --version",
+            "No positional arguments are accepted",
+            "PLAN/.conflicts/",
+            "Exit codes:",
+        ):
+            self.assertIn(expected, help_text)
+
     def test_product_version_is_one_one_one(self):
         self.assertEqual(SCRIPT_VERSION, "1.1.1")
 

@@ -43,6 +43,20 @@ python sync.py
 
 The command is automatic and does not ask for confirmation. A run with no changes returns `0` and does not rewrite cards or files.
 
+## CLI quick reference
+
+The script has no positional arguments. The recommended flow is to configure once, use the normal sync for daily work, and use TXT import only when needed:
+
+| Command | Use |
+| --- | --- |
+| `python sync.py --setup` | Create or replace `.env`, then run the first synchronization. |
+| `python sync.py` | Synchronize the configured Trello list and `PLAN/`. |
+| `python sync.py --import` | Import immediate `PLAN/*.txt` files as todo cards, then synchronize. |
+| `python sync.py --help` | Show the complete operations, editable fields, recovery paths and exit codes. |
+| `python sync.py --version` | Show the runtime version. |
+
+`--setup` and `--import` are mutually exclusive. The full help is kept beside the implementation so it stays aligned with the actual CLI.
+
 During synchronization the terminal shows the current phase and card, for example `lendo card 2/5` and `sincronizando card 2/5`. The script reads complementary Trello resources sequentially to respect the API limit, so a card can require several requests. Rate-limit responses and retries are announced with the wait time, and the final line includes the elapsed time and number of Trello requests.
 
 The raw reference keeps the card, list, board, labels, checklists/items, actions, attachments, members, custom-field values and definitions, votes, stickers and Power-Up data when the API exposes them. Each complementary resource has a `complete`, `empty`, `unsupported` or `failed` status. A transient or failed resource is never silently replaced with an empty list: the previous section is retained when available, the card is not rewritten from that incomplete bundle, and cleanup is disabled for the run. A 403/404 optional endpoint is recorded as unsupported and does not block unrelated cards.
@@ -279,4 +293,4 @@ Use only a Trello list dedicated to testing. Inspect the summary, `teste/PLAN/.c
 
 ## Deliberate limitations
 
-The MVP does not edit comments or read-only data, move cards, run as a service or download attachments. Validation beyond Windows remains external acceptance work because no Linux/macOS environments were available; the implementation and evidence are recorded in [PLAN.md](PLAN.md). Cards are created only by explicitly copying `PLAN/_modelo-card.md` or importing a TXT with `python sync.py --import`.
+The MVP does not edit comments or read-only data, move cards, run as a service or download attachments. Validation beyond Windows remains external acceptance work because no Linux/macOS environments were available; the implementation and evidence are recorded in the changelog and test suite. Cards are created only by explicitly copying `PLAN/_modelo-card.md` or importing a TXT with `python sync.py --import`.
