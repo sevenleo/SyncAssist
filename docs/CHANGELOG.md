@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.3] - 2026-09-14
+
+### Documentation
+
+- Audited PLAN.md against the implementation and removed completed checklist items.
+- Recorded the current evidence: 82 offline tests passed, syntax/CLI checks passed and real Trello validation remains pending.
+- Updated README.md with the current runtime scope, fetched resources and known limitations.
+- No runtime behavior changed; the script version remains 1.0.2.
+
 ## [1.0.2] - 2026-09-14
 
 ### Fixed
