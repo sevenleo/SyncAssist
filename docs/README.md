@@ -6,7 +6,7 @@ Each copy of `sync.py` represents one Trello list. When the script runs, it crea
 
 Runtime version: `1.2.0`. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-The implementation is covered by 113 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
+The implementation is covered by 119 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ To configure credentials manually, fill in `.env`:
 ```dotenv
 TRELLO_API_KEY=your_api_key
 TRELLO_TOKEN=your_token
-# Optional setup-resume value; normal synchronization does not need it.
+# Required Trello board URL.
 TRELLO_BOARD_URL=https://trello.com/b/your-board
 TRELLO_LIST_ID=project_list_id
 ```
@@ -79,13 +79,13 @@ When API credentials are missing, the wizard points you to the Trello administra
 https://trello.com/1/authorize?expiration=never&scope=read%2Cwrite&response_type=token&key=YOUR_API_KEY
 ```
 
-If .env already contains SyncAssist settings, the wizard asks whether to continue with them or start over. Press Enter to continue (the default); valid saved API keys, tokens, board URLs and list IDs are kept, and only missing or invalid settings are requested. A saved list ID skips the board URL and list selection. If the list ID is missing, the wizard reuses TRELLO_BOARD_URL when available. It saves the URL and current credentials after Trello confirms the board but before loading its lists, so rerunning --setup resumes at list selection. TRELLO_BOARD_URL is optional for normal synchronization. Enter n to restart all setup fields. The wizard preserves comments and unrelated .env entries.
+If .env already contains SyncAssist settings, the wizard asks whether to continue with them or start over. Press Enter to continue (the default); valid saved API keys, tokens, board URLs and list IDs are kept, and only missing or invalid settings are requested. TRELLO_BOARD_URL is required. If a saved list ID exists but the board URL is missing or invalid, setup asks for and verifies a board URL while keeping the list ID. When the list ID is missing, setup reuses the saved board URL when available and asks for the list. It saves a verified URL before loading lists, so rerunning --setup resumes at list selection. Enter n to restart all setup fields. The wizard preserves comments and unrelated .env entries.
 
 Setup also creates or updates `.gitignore` before saving credentials, adding `.env`, `PLAN/` and `sync.py` while preserving existing rules.
 
 The token is requested with visible terminal input; verify the value before pressing Enter and avoid sharing the screen during setup. The **Secret** field in the Trello Auth tab is used by the OAuth 1.0 flow and is not the SyncAssist `TRELLO_TOKEN`. Because the wizard uses `response_type=token` without `return_url` or `callback_method`, **Allowed origins** does not need to be filled in.
 
-When a board URL is needed, the wizard lists its active lists for selection. It does not query, create or choose a completion label. Once setup completes, synchronization runs immediately. Cancellation or setup failure does not run sync.
+When the board URL is needed, the wizard lists the board's active lists for selection. It does not query, create or choose a completion label. Starting `sync.py` checks every required env value before any synchronization or import work. If values are missing, it lists their names and asks whether to run setup; declining exits without changing files. After setup completes, it asks whether to start synchronization. Cancellation or setup failure does not run sync.
 
 ## Import TXT tasks
 

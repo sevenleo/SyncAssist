@@ -28,6 +28,7 @@ from sync import (
     finalize_imports,
     import_txt_tasks,
     _filename_plan,
+    _missing_env_keys,
     _assert_safe_plan_file,
     _load_local_documents,
     _new_report,
@@ -72,7 +73,7 @@ class EnvTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_env_text("A=\"unclosed\n")
 
-    def test_config_requires_the_three_project_values(self):
+    def test_config_requires_all_four_project_values(self):
         root = Path(tempfile.mkdtemp())
         with self.assertRaises(ValueError):
             Config.from_values({"TRELLO_API_KEY": "key"}, root)
@@ -81,11 +82,21 @@ class EnvTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
         )
         self.assertEqual(config.plan_dir, root / "PLAN")
+        with self.assertRaisesRegex(ValueError, "TRELLO_BOARD_URL"):
+            Config.from_values(
+                {
+                    "TRELLO_API_KEY": "key",
+                    "TRELLO_TOKEN": "token",
+                    "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
+                },
+                root,
+            )
 
     def test_empty_report_explicitly_says_no_changes(self):
         output = io.StringIO()
@@ -163,6 +174,7 @@ class FilenameTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -558,6 +570,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -584,6 +597,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -602,6 +616,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -640,6 +655,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -665,6 +681,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -687,6 +704,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -724,6 +742,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -752,6 +771,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -769,6 +789,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -794,6 +815,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -830,6 +852,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -862,6 +885,7 @@ class ClientTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef12",
             },
             root,
@@ -928,7 +952,7 @@ class SetupTests(unittest.TestCase):
             "python sync.py --import",
             "python sync.py --version",
             "Existing values continue by",
-            "Answer no to restart",
+            "After setup, confirm whether to start synchronization",
             "TRELLO_BOARD_URL",
             "resumes at list selection",
             "No positional arguments are accepted",
@@ -940,40 +964,108 @@ class SetupTests(unittest.TestCase):
     def test_product_version_matches_release(self):
         self.assertEqual(SCRIPT_VERSION, "1.2.0")
 
-    def test_main_runs_sync_after_successful_setup(self):
+    def complete_env(self):
+        return {
+            "TRELLO_API_KEY": "api-key",
+            "TRELLO_TOKEN": "token",
+            "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
+            "TRELLO_LIST_ID": "abcdef1234567890abcdef34",
+        }
+
+    def test_main_runs_sync_after_setup_and_explicit_confirmation(self):
         config = object()
         report = {"failures": 0, "conflicts": 0}
-        with mock.patch("sync.run_setup", return_value=0) as setup, \
-                mock.patch("sync.Config.from_file", return_value=config) as load_config, \
-                mock.patch("sync.sync_once", return_value=report) as sync_call, \
-                mock.patch("sync._print_report") as print_report:
+        with (
+            mock.patch("sync.run_setup", return_value=0) as setup,
+            mock.patch("sync._missing_env_keys", return_value=[]),
+            mock.patch("builtins.input", return_value="y") as confirm,
+            mock.patch("sync.Config.from_file", return_value=config) as load_config,
+            mock.patch("sync.sync_once", return_value=report) as sync_call,
+            mock.patch("sync._print_report") as print_report,
+        ):
             self.assertEqual(main(["--setup"]), 0)
 
         setup.assert_called_once()
+        self.assertEqual(confirm.call_args.args[0], "Setup completed. Start synchronization now? [y/N]: ")
         load_config.assert_called_once()
         sync_call.assert_called_once()
         self.assertIs(sync_call.call_args.args[0], config)
         self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
         print_report.assert_called_once_with(report)
 
-    def test_main_starts_setup_automatically_when_env_is_missing(self):
+    def test_main_offers_setup_when_required_env_is_missing(self):
         config = object()
         report = {"failures": 0, "conflicts": 0}
-        with mock.patch("sync.Path.is_file", return_value=False), \
-                mock.patch("sync.run_setup", return_value=0) as setup, \
-                mock.patch("sync.Config.from_file", return_value=config) as load_config, \
-                mock.patch("sync.sync_once", return_value=report) as sync_call, \
-                mock.patch("sync._print_report"):
+        with (
+            mock.patch("sync._missing_env_keys", side_effect=[["TRELLO_BOARD_URL"], []]) as missing,
+            mock.patch("builtins.input", side_effect=["y", "y"]) as confirm,
+            mock.patch("sync.run_setup", return_value=0) as setup,
+            mock.patch("sync.Config.from_file", return_value=config) as load_config,
+            mock.patch("sync.sync_once", return_value=report) as sync_call,
+            mock.patch("sync._print_report"),
+        ):
             self.assertEqual(main([]), 0)
 
-        setup.assert_called_once()
+        self.assertEqual(missing.call_count, 2)
+        self.assertEqual(setup.call_count, 1)
+        self.assertEqual(
+            [call.args[0] for call in confirm.call_args_list],
+            [
+                "Would you like to run setup now? [y/N]: ",
+                "Setup completed. Start synchronization now? [y/N]: ",
+            ],
+        )
         load_config.assert_called_once()
         sync_call.assert_called_once()
 
+    def test_main_declining_setup_leaves_sync_unstarted(self):
+        with (
+            mock.patch("sync._missing_env_keys", return_value=["TRELLO_BOARD_URL"]),
+            mock.patch("builtins.input", return_value="n"),
+            mock.patch("sync.run_setup") as setup,
+            mock.patch("sync.Config.from_file") as load_config,
+            mock.patch("sync.sync_once") as sync_call,
+        ):
+            self.assertEqual(main([]), 0)
+
+        setup.assert_not_called()
+        load_config.assert_not_called()
+        sync_call.assert_not_called()
+
+    def test_main_does_not_sync_if_setup_leaves_board_url_missing(self):
+        with (
+            mock.patch("sync._missing_env_keys", side_effect=[["TRELLO_BOARD_URL"], ["TRELLO_BOARD_URL"]]),
+            mock.patch("builtins.input", return_value="y"),
+            mock.patch("sync.run_setup", return_value=0) as setup,
+            mock.patch("sync.Config.from_file") as load_config,
+            mock.patch("sync.sync_once") as sync_call,
+        ):
+            self.assertEqual(main([]), 2)
+
+        setup.assert_called_once()
+        load_config.assert_not_called()
+        sync_call.assert_not_called()
+
+    def test_main_skips_sync_when_user_declines_after_setup(self):
+        with (
+            mock.patch("sync._missing_env_keys", side_effect=[["TRELLO_BOARD_URL"], []]),
+            mock.patch("builtins.input", side_effect=["y", "n"]),
+            mock.patch("sync.run_setup", return_value=0) as setup,
+            mock.patch("sync.Config.from_file") as load_config,
+            mock.patch("sync.sync_once") as sync_call,
+        ):
+            self.assertEqual(main([]), 0)
+
+        setup.assert_called_once()
+        load_config.assert_not_called()
+        sync_call.assert_not_called()
+
     def test_main_does_not_sync_when_setup_is_cancelled(self):
-        with mock.patch("sync.run_setup", return_value=1) as setup, \
-                mock.patch("sync.Config.from_file") as load_config, \
-                mock.patch("sync.sync_once") as sync_call:
+        with (
+            mock.patch("sync.run_setup", return_value=1) as setup,
+            mock.patch("sync.Config.from_file") as load_config,
+            mock.patch("sync.sync_once") as sync_call,
+        ):
             self.assertEqual(main(["--setup"]), 1)
 
         setup.assert_called_once()
@@ -984,13 +1076,15 @@ class SetupTests(unittest.TestCase):
         config = object()
         import_result = mock.Mock(errors=[], failed=0)
         report = {"failures": 0, "conflicts": 0}
-        with mock.patch("sync.Path.is_file", return_value=True), \
-                mock.patch("sync.Config.from_file", return_value=config), \
-                mock.patch("sync.import_txt_tasks", return_value=import_result) as import_tasks, \
-                mock.patch("sync.sync_once", return_value=report) as sync_call, \
-                mock.patch("sync.finalize_imports") as finalize, \
-                mock.patch("sync._print_import_report") as print_import, \
-                mock.patch("sync._print_report") as print_report:
+        with (
+            mock.patch("sync._missing_env_keys", return_value=[]),
+            mock.patch("sync.Config.from_file", return_value=config),
+            mock.patch("sync.import_txt_tasks", return_value=import_result) as import_tasks,
+            mock.patch("sync.sync_once", return_value=report) as sync_call,
+            mock.patch("sync.finalize_imports") as finalize,
+            mock.patch("sync._print_import_report") as print_import,
+            mock.patch("sync._print_report") as print_report,
+        ):
             self.assertEqual(main(["--import"]), 0)
 
         import_tasks.assert_called_once_with(config)
@@ -1004,12 +1098,14 @@ class SetupTests(unittest.TestCase):
     def test_main_without_flags_keeps_the_normal_sync_path(self):
         config = object()
         report = {"failures": 0, "conflicts": 0}
-        with mock.patch("sync.Path.is_file", return_value=True), \
-                mock.patch("sync.run_setup") as setup, \
-                mock.patch("sync.Config.from_file", return_value=config), \
-                mock.patch("sync.import_txt_tasks") as import_tasks, \
-                mock.patch("sync.sync_once", return_value=report) as sync_call, \
-                mock.patch("sync._print_report") as print_report:
+        with (
+            mock.patch("sync._missing_env_keys", return_value=[]),
+            mock.patch("sync.run_setup") as setup,
+            mock.patch("sync.Config.from_file", return_value=config),
+            mock.patch("sync.import_txt_tasks") as import_tasks,
+            mock.patch("sync.sync_once", return_value=report) as sync_call,
+            mock.patch("sync._print_report") as print_report,
+        ):
             self.assertEqual(main([]), 0)
 
         import_tasks.assert_not_called()
@@ -1019,6 +1115,30 @@ class SetupTests(unittest.TestCase):
         self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
         print_report.assert_called_once_with(report)
 
+    def test_missing_env_keys_detects_absent_or_empty_board_url(self):
+        for remove_value in (False, True):
+            with self.subTest(remove_value=remove_value):
+                values = self.complete_env()
+                if remove_value:
+                    values.pop("TRELLO_BOARD_URL")
+                else:
+                    values["TRELLO_BOARD_URL"] = ""
+                with (
+                    mock.patch("sync.Path.is_file", return_value=True),
+                    mock.patch("sync.load_env", return_value=values),
+                ):
+                    self.assertEqual(_missing_env_keys(Path(".env")), ["TRELLO_BOARD_URL"])
+
+    def test_missing_env_file_reports_all_required_keys(self):
+        with (
+            mock.patch("sync.Path.is_file", return_value=False),
+            mock.patch("sync.load_env") as load_env,
+        ):
+            self.assertEqual(
+                _missing_env_keys(Path(".env")),
+                ["TRELLO_API_KEY", "TRELLO_TOKEN", "TRELLO_BOARD_URL", "TRELLO_LIST_ID"],
+            )
+        load_env.assert_not_called()
 
     def test_board_url_accepts_trello_board_and_rejects_other_routes(self):
         self.assertEqual(parse_board_url("https://trello.com/b/board-short/quad?x=1#fragment"), "board-short")
@@ -1080,6 +1200,7 @@ class SetupTests(unittest.TestCase):
         env_text = (root / ".env").read_text(encoding="utf-8")
         self.assertIn("TRELLO_API_KEY=api-key", env_text)
         self.assertIn("TRELLO_TOKEN=secret-token", env_text)
+        self.assertIn("TRELLO_BOARD_URL=https://trello.com/b/board-short", env_text)
         self.assertIn("TRELLO_LIST_ID=abcdef1234567890abcdef56", env_text)
         self.assertNotIn("TRELLO_DONE_LABEL_ID", env_text)
         self.assertIn("scope=read%2Cwrite", output)
@@ -1097,6 +1218,7 @@ class SetupTests(unittest.TestCase):
         (root / ".env").write_text(
             "TRELLO_API_KEY=api-key\n"
             "TRELLO_TOKEN=secret-token\n"
+            "TRELLO_BOARD_URL=https://trello.com/b/board-short\n"
             "TRELLO_LIST_ID=abcdef1234567890abcdef34\n",
             encoding="utf-8",
         )
@@ -1164,6 +1286,7 @@ class SetupTests(unittest.TestCase):
             "OTHER_SETTING=keep-me\n"
             "TRELLO_API_KEY=api-key\n"
             "TRELLO_TOKEN=token\n"
+            "TRELLO_BOARD_URL=https://trello.com/b/board-short\n"
             "TRELLO_LIST_ID=abcdef1234567890abcdef34\n"
         )
         (root / ".env").write_text(original, encoding="utf-8")
@@ -1187,6 +1310,48 @@ class SetupTests(unittest.TestCase):
         self.assertIn("Reusing the saved API Key.", output.getvalue())
         self.assertIn("Reusing the saved User Token.", output.getvalue())
         self.assertIn("board URL and list selection are skipped", output.getvalue())
+
+    def test_setup_fills_missing_board_url_while_reusing_saved_list(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".env").write_text(
+            "TRELLO_API_KEY=saved-api\n"
+            "TRELLO_TOKEN=saved-token\n"
+            "TRELLO_LIST_ID=abcdef1234567890abcdef34\n",
+            encoding="utf-8",
+        )
+        prompts = []
+        values = iter(["", "https://trello.com/b/board-short"])
+        output = io.StringIO()
+
+        class BoardOnlyApi(SetupApi):
+            def get_board_lists(self, board_id):
+                self.fail("saved list should skip list selection")
+
+        api = BoardOnlyApi()
+
+        def visible_input(prompt):
+            prompts.append(prompt)
+            return next(values)
+
+        result = run_setup(
+            root,
+            input_fn=visible_input,
+            secret_input_fn=lambda prompt: self.fail("saved token should be reused"),
+            output=output,
+            client_factory=lambda api_key, token: api,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            prompts,
+            [
+                "Continue with saved values or start from scratch? [Y/n]: ",
+                "Paste the Trello board URL: ",
+            ],
+        )
+        env = parse_env_text((root / ".env").read_text(encoding="utf-8"))
+        self.assertEqual(env["TRELLO_BOARD_URL"], "https://trello.com/b/board-short")
+        self.assertEqual(env["TRELLO_LIST_ID"], "abcdef1234567890abcdef34")
 
     def test_setup_continues_partial_env_and_only_prompts_for_missing_list(self):
         root = Path(tempfile.mkdtemp())
@@ -1320,6 +1485,7 @@ class SetupTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         (root / ".env").write_text(
             "TRELLO_API_KEY=saved-api\n"
+            "TRELLO_BOARD_URL=https://trello.com/b/board-short\n"
             "TRELLO_LIST_ID=abcdef1234567890abcdef34\n"
             "OTHER_SETTING=keep-me\n",
             encoding="utf-8",
@@ -1614,6 +1780,7 @@ class ImportTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": ImportApi.list_id,
             },
             root,
@@ -1766,6 +1933,7 @@ class SyncOnceTests(unittest.TestCase):
             {
                 "TRELLO_API_KEY": "key",
                 "TRELLO_TOKEN": "token",
+                "TRELLO_BOARD_URL": "https://trello.com/b/board-short",
                 "TRELLO_LIST_ID": "abcdef1234567890abcdef34",
             },
             root,

@@ -17,7 +17,7 @@ they can be tested without credentials or network access.
 #
 # CLI
 #   python sync.py          Normal synchronization; PLAN/ is created as needed.
-#   python sync.py --setup  Interactive .env setup, followed by synchronization.
+#   python sync.py --setup  Interactive .env setup, followed by a sync confirmation.
 #   python sync.py --import Import PLAN/*.txt as todo cards, followed by sync.
 #   python sync.py --help   Show the complete command and file reference.
 #   python sync.py --version
@@ -26,8 +26,8 @@ they can be tested without credentials or network access.
 # Setup
 #   --setup collects any missing key from https://trello.com/apps/admin
 #   (Power-Up Trello Auth tab), User Token from its authorization link, board
-#   URL and active list. It saves TRELLO_BOARD_URL after the board is
-#   verified so setup can resume at list selection. Existing values
+#   URL and active list. TRELLO_BOARD_URL is required and saved after the board
+#   is verified so setup can resume at list selection. Existing values
 #   continue by default; only missing settings are requested. Restart replaces
 #   setup values and preserves other .env entries. Keep the token private.
 #
@@ -85,8 +85,7 @@ API_BASE = "https://api.trello.com/1"
 METADATA_BEGIN = "<!-- syncassist:metadata"
 METADATA_END = "syncassist:end -->"
 SECTION_TEMPLATE = "<!-- syncassist:{token}:{section}:{edge} -->"
-ENV_KEYS = ("TRELLO_API_KEY", "TRELLO_TOKEN", "TRELLO_LIST_ID")
-SETUP_ENV_KEYS = (*ENV_KEYS, "TRELLO_BOARD_URL")
+ENV_KEYS = ("TRELLO_API_KEY", "TRELLO_TOKEN", "TRELLO_BOARD_URL", "TRELLO_LIST_ID")
 TEMPLATE_FILENAME = "_modelo-card.md"
 ID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
 TEMP_ID_PATTERN = re.compile(r"^new:[a-z0-9-]{1,64}$")
@@ -787,7 +786,7 @@ def _setup_prepare_env(env_path: Path, input_fn: Any, output: Any) -> dict[str, 
         return {}
 
     existing = load_env(env_path)
-    if any(existing.get(key, "").strip() for key in SETUP_ENV_KEYS):
+    if any(existing.get(key, "").strip() for key in ENV_KEYS):
         print(f"SyncAssist settings already exist at {env_path}.", file=output)
         while True:
             answer = _setup_input(
@@ -875,6 +874,56 @@ def _setup_active_lists(lists: Iterable[Mapping[str, Any]], board_id: str) -> li
     return _ordered_remote(active)
 
 
+def _setup_resolve_board(
+    client: Any,
+    input_fn: Any,
+    output: Any,
+    saved_board_url: str = "",
+) -> tuple[str, Mapping[str, Any], str]:
+    board_url = saved_board_url.strip()
+    using_saved_board_url = bool(board_url)
+    if using_saved_board_url:
+        print("Reusing the saved Trello board URL.", file=output)
+    while True:
+        if not board_url:
+            board_url = _setup_input(input_fn, "Paste the Trello board URL: ")
+            using_saved_board_url = False
+        try:
+            board_ref = parse_board_url(board_url)
+        except ValueError as exc:
+            if using_saved_board_url:
+                print(f"The saved Trello board URL is invalid: {exc}", file=output)
+            else:
+                print(f"Invalid URL: {exc}", file=output)
+            board_url = ""
+            using_saved_board_url = False
+            continue
+        try:
+            board_info = client.get_board(board_ref)
+        except RemoteError as exc:
+            if exc.status != 404:
+                raise
+            if using_saved_board_url:
+                print("The saved Trello board was not found; enter another URL.", file=output)
+            else:
+                print("Board not found; enter another URL.", file=output)
+            board_url = ""
+            using_saved_board_url = False
+            continue
+        board_id = _trello_id(board_info)
+        if not ID_PATTERN.fullmatch(board_id):
+            raise RemoteError("Trello returned an invalid board ID")
+        if board_info.get("closed"):
+            if using_saved_board_url:
+                print("The saved Trello board is archived; enter another URL.", file=output)
+            else:
+                print("Board is archived; enter another URL.", file=output)
+            board_url = ""
+            using_saved_board_url = False
+            continue
+        return board_url, board_info, board_id
+
+
 def run_setup(
     project_root: Path,
     *,
@@ -918,70 +967,44 @@ def run_setup(
 
         saved_list_id = existing.get("TRELLO_LIST_ID", "").strip()
         list_id = saved_list_id if ID_PATTERN.fullmatch(saved_list_id) else ""
+        saved_board_url = existing.get("TRELLO_BOARD_URL", "").strip()
+        try:
+            parse_board_url(saved_board_url)
+            board_url_valid = True
+        except ValueError:
+            board_url_valid = False
         already_complete = bool(
             _valid_setup_credential(existing.get("TRELLO_API_KEY", ""))
             and _valid_setup_credential(existing.get("TRELLO_TOKEN", ""))
             and ID_PATTERN.fullmatch(existing.get("TRELLO_LIST_ID", "").strip())
+            and board_url_valid
         )
         selected_list_name = ""
-        board_url = ""
-        if list_id:
+        board_url = saved_board_url if board_url_valid else ""
+        if list_id and board_url_valid:
             print("Reusing the saved Trello list; board URL and list selection are skipped.", file=output)
+        elif list_id:
+            print("Reusing the saved Trello list; a valid board URL is required.", file=output)
+            client = client_factory(api_key, token)
+            board_url, _, _ = _setup_resolve_board(
+                client, input_fn, output, saved_board_url
+            )
         else:
             if saved_list_id:
                 print("The saved Trello list ID is invalid; select a list again.", file=output)
-            board_url = existing.get("TRELLO_BOARD_URL", "").strip()
-            using_saved_board_url = bool(board_url)
-            if using_saved_board_url:
-                print("Reusing the saved Trello board URL.", file=output)
             client = client_factory(api_key, token)
-            while True:
-                if not board_url:
-                    board_url = _setup_input(input_fn, "Paste the Trello board URL: ")
-                    using_saved_board_url = False
-                try:
-                    board_ref = parse_board_url(board_url)
-                except ValueError as exc:
-                    if using_saved_board_url:
-                        print(f"The saved Trello board URL is invalid: {exc}", file=output)
-                    else:
-                        print(f"Invalid URL: {exc}", file=output)
-                    board_url = ""
-                    using_saved_board_url = False
-                    continue
-                try:
-                    board_info = client.get_board(board_ref)
-                except RemoteError as exc:
-                    if exc.status == 404:
-                        if using_saved_board_url:
-                            print("The saved Trello board was not found; enter another URL.", file=output)
-                        else:
-                            print("Board not found; enter another URL.", file=output)
-                        board_url = ""
-                        using_saved_board_url = False
-                        continue
-                    raise
-                board_id = _trello_id(board_info)
-                if not ID_PATTERN.fullmatch(board_id):
-                    raise RemoteError("Trello returned an invalid board ID")
-                if board_info.get("closed"):
-                    if using_saved_board_url:
-                        print("The saved Trello board is archived; enter another URL.", file=output)
-                    else:
-                        print("Board is archived; enter another URL.", file=output)
-                    board_url = ""
-                    using_saved_board_url = False
-                    continue
-                _setup_write_env(
-                    env_path,
-                    {
-                        "TRELLO_API_KEY": api_key,
-                        "TRELLO_TOKEN": token,
-                        "TRELLO_BOARD_URL": board_url,
-                        "TRELLO_LIST_ID": "",
-                    },
-                )
-                break
+            board_url, board_info, board_id = _setup_resolve_board(
+                client, input_fn, output, saved_board_url
+            )
+            _setup_write_env(
+                env_path,
+                {
+                    "TRELLO_API_KEY": api_key,
+                    "TRELLO_TOKEN": token,
+                    "TRELLO_BOARD_URL": board_url,
+                    "TRELLO_LIST_ID": "",
+                },
+            )
 
             lists = _setup_active_lists(client.get_board_lists(board_id), board_id)
             if not lists:
@@ -997,16 +1020,14 @@ def run_setup(
             setup_values = {
                 "TRELLO_API_KEY": api_key,
                 "TRELLO_TOKEN": token,
+                "TRELLO_BOARD_URL": board_url,
                 "TRELLO_LIST_ID": list_id,
             }
-            if board_url:
-                setup_values["TRELLO_BOARD_URL"] = board_url
             _setup_write_env(env_path, setup_values)
         print("\nSetup completed.", file=output)
         print(f"File saved: {env_path}", file=output)
         print(f"Selected list: {selected_list_name or list_id}", file=output)
         print("Completion status: Trello's native due-date checkbox", file=output)
-        print("\nThe initial synchronization will run now.", file=output)
         return 0
     except SetupCancelled as exc:
         print(f"Setup cancelled: {exc}", file=output)
@@ -4157,14 +4178,15 @@ def _exit_code(report: Mapping[str, Any]) -> int:
 CLI_HELP_EPILOG = """\
 Operations:
   python sync.py
-      Run one synchronization from .env. If .env is missing, setup starts
-      automatically before the configured Trello list is synchronized.
+      Check required .env values, then run one synchronization. If any are
+      missing, setup runs only after confirmation.
 
   python sync.py --setup
       Interactively create or resume .env. Existing values continue by
       default; missing settings are collected before synchronization.
       A verified TRELLO_BOARD_URL is saved so setup resumes at list selection.
-      Answer no to restart. Other .env entries are preserved.
+      After setup, confirm whether to start synchronization. Answer no to
+      restart setup. Other .env entries are preserved.
 
   python sync.py --import
       Convert only PLAN/*.txt files directly inside PLAN/ into new todo cards,
@@ -4187,7 +4209,6 @@ Recommended workflow:
   2. Run `python sync.py --setup` once, or create .env with:
        TRELLO_API_KEY=...
        TRELLO_TOKEN=...
-       # Optional; regular synchronization does not need this setup value.
        TRELLO_BOARD_URL=https://trello.com/b/<board-id>
        TRELLO_LIST_ID=...
   3. Copy PLAN/_modelo-card.md to PLAN/todo-<slug>.md or PLAN/done-<slug>.md.
@@ -4196,7 +4217,7 @@ Recommended workflow:
   6. Use `--import` only for new .txt files directly in PLAN/.
 
 Project files:
-  .env                    Local credentials and optional setup-resume URL (private).
+  .env                    Required credentials, board URL and list configuration (private).
   PLAN/_modelo-card.md    Reserved template; never creates a card by itself.
   PLAN/todo-*.md          Open card documents.
   PLAN/done-*.md          Completed card documents.
@@ -4245,18 +4266,55 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _missing_env_keys(env_path: Path) -> list[str]:
+    if not env_path.is_file():
+        return list(ENV_KEYS)
+    values = load_env(env_path)
+    return [key for key in ENV_KEYS if not str(values.get(key, "")).strip()]
+
+
+def _confirm_yes_no(prompt: str) -> bool:
+    while True:
+        answer = input(prompt).strip().casefold()
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"", "n", "no"}:
+            return False
+        print("Please answer yes or no.", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     project_root = Path(__file__).resolve().parent
     env_path = project_root / ".env"
     try:
-        if args.setup or not env_path.is_file():
-            if not args.setup:
-                _print_progress("SyncAssist: configuration file not found; starting setup...")
+        should_run_setup = args.setup
+        if not should_run_setup:
+            missing = _missing_env_keys(env_path)
+            if missing:
+                print("Missing required environment variables: " + ", ".join(missing))
+                if not _confirm_yes_no("Would you like to run setup now? [y/N]: "):
+                    print("Synchronization cancelled. No changes were made.")
+                    return 0
+                should_run_setup = True
+
+        if should_run_setup:
             setup_code = run_setup(project_root)
             if setup_code != 0:
                 return setup_code
+            missing = _missing_env_keys(env_path)
+            if missing:
+                print(
+                    "ERROR configuration: setup completed but required environment variables are still missing: "
+                    + ", ".join(missing),
+                    file=sys.stderr,
+                )
+                return 2
+            if not _confirm_yes_no("Setup completed. Start synchronization now? [y/N]: "):
+                print("Synchronization skipped.")
+                return 0
+
         _print_progress("SyncAssist: Loading configuration...")
         config = Config.from_file(env_path, project_root)
         if args.import_tasks:
