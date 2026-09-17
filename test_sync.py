@@ -929,6 +929,8 @@ class SetupTests(unittest.TestCase):
             "python sync.py --version",
             "Existing values continue by",
             "Answer no to restart",
+            "TRELLO_BOARD_URL",
+            "resumes at list selection",
             "No positional arguments are accepted",
             "PLAN/.conflicts/",
             "Exit codes:",
@@ -1192,11 +1194,12 @@ class SetupTests(unittest.TestCase):
             "# Keep this comment.\n"
             "OTHER_SETTING=keep-me\n"
             "TRELLO_API_KEY=saved-api\n"
-            "TRELLO_TOKEN=saved-token\n",
+            "TRELLO_TOKEN=saved-token\n"
+            "TRELLO_BOARD_URL=https://trello.com/b/board-short\n",
             encoding="utf-8",
         )
         api = SetupApi()
-        values = iter(["", "https://trello.com/b/board-short", "2"])
+        values = iter(["", "2"])
         prompts = []
         output = io.StringIO()
 
@@ -1219,15 +1222,99 @@ class SetupTests(unittest.TestCase):
             prompts,
             [
                 "Continue with saved values or start from scratch? [Y/n]: ",
-                "Paste the Trello board URL: ",
                 "Choose the project list: ",
             ],
         )
-        env = parse_env_text((root / ".env").read_text(encoding="utf-8"))
+        env_text = (root / ".env").read_text(encoding="utf-8")
+        env = parse_env_text(env_text)
+        self.assertIn("# Keep this comment.", env_text)
         self.assertEqual(env["TRELLO_API_KEY"], "saved-api")
         self.assertEqual(env["TRELLO_TOKEN"], "saved-token")
+        self.assertEqual(env["TRELLO_BOARD_URL"], "https://trello.com/b/board-short")
         self.assertEqual(env["TRELLO_LIST_ID"], "abcdef1234567890abcdef56")
         self.assertEqual(env["OTHER_SETTING"], "keep-me")
+
+    def test_setup_checkpoints_verified_board_and_resumes_at_list_selection(self):
+        root = Path(tempfile.mkdtemp())
+        env_path = root / ".env"
+        env_path.write_text(
+            "# Keep this comment.\n"
+            "OTHER_SETTING=keep-me\n"
+            "TRELLO_API_KEY=saved-api\n"
+            "TRELLO_TOKEN=saved-token\n",
+            encoding="utf-8",
+        )
+        test_case = self
+
+        class InterruptingApi(SetupApi):
+            def get_board(self, board_ref):
+                if board_ref == "missing":
+                    values = parse_env_text(env_path.read_text(encoding="utf-8"))
+                    test_case.assertNotIn("TRELLO_BOARD_URL", values)
+                    raise RemoteError("board not found", status=404)
+                return super().get_board(board_ref)
+
+            def get_board_lists(self, board_id):
+                env_text = env_path.read_text(encoding="utf-8")
+                values = parse_env_text(env_text)
+                test_case.assertEqual(values["TRELLO_API_KEY"], "saved-api")
+                test_case.assertEqual(values["TRELLO_TOKEN"], "saved-token")
+                test_case.assertEqual(values["TRELLO_BOARD_URL"], "https://trello.com/b/board-short")
+                test_case.assertEqual(values["TRELLO_LIST_ID"], "")
+                test_case.assertEqual(values["OTHER_SETTING"], "keep-me")
+                test_case.assertIn("# Keep this comment.", env_text)
+                raise RemoteError("temporary list lookup failure", status=503)
+
+        prompts = []
+        input_values = iter(["", "https://trello.com/b/missing", "https://trello.com/b/board-short"])
+
+        def visible_input(prompt):
+            prompts.append(prompt)
+            return next(input_values)
+
+        with self.assertRaises(RemoteError) as context:
+            run_setup(
+                root,
+                input_fn=visible_input,
+                secret_input_fn=lambda prompt: self.fail("saved token should be reused"),
+                output=io.StringIO(),
+                client_factory=lambda api_key, token: InterruptingApi(),
+            )
+        self.assertEqual(context.exception.status, 503)
+        self.assertEqual(
+            prompts,
+            [
+                "Continue with saved values or start from scratch? [Y/n]: ",
+                "Paste the Trello board URL: ",
+                "Paste the Trello board URL: ",
+            ],
+        )
+
+        resume_prompts = []
+        resume_values = iter(["", "1"])
+
+        def resume_input(prompt):
+            resume_prompts.append(prompt)
+            return next(resume_values)
+
+        result = run_setup(
+            root,
+            input_fn=resume_input,
+            secret_input_fn=lambda prompt: self.fail("saved credentials should be reused"),
+            output=io.StringIO(),
+            client_factory=lambda api_key, token: SetupApi(),
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            resume_prompts,
+            [
+                "Continue with saved values or start from scratch? [Y/n]: ",
+                "Choose the project list: ",
+            ],
+        )
+        resumed_env = parse_env_text(env_path.read_text(encoding="utf-8"))
+        self.assertEqual(resumed_env["TRELLO_BOARD_URL"], "https://trello.com/b/board-short")
+        self.assertEqual(resumed_env["TRELLO_LIST_ID"], SetupApi.list_id)
 
     def test_setup_continues_saved_list_and_only_prompts_for_missing_token(self):
         root = Path(tempfile.mkdtemp())
@@ -1291,7 +1378,8 @@ class SetupTests(unittest.TestCase):
         (root / ".env").write_text(
             "TRELLO_API_KEY=invalid,api\n"
             "TRELLO_TOKEN=saved-token\n"
-            "TRELLO_LIST_ID=not-a-trello-id\n",
+            "TRELLO_LIST_ID=not-a-trello-id\n"
+            "TRELLO_BOARD_URL=not-a-board-url\n",
             encoding="utf-8",
         )
         prompts = []
@@ -1325,10 +1413,12 @@ class SetupTests(unittest.TestCase):
         )
         self.assertIn("The saved API Key is invalid; enter it again.", output.getvalue())
         self.assertIn("The saved Trello list ID is invalid; select a list again.", output.getvalue())
+        self.assertIn("The saved Trello board URL is invalid", output.getvalue())
         env = parse_env_text((root / ".env").read_text(encoding="utf-8"))
         self.assertEqual(env["TRELLO_API_KEY"], "new-api")
         self.assertEqual(env["TRELLO_TOKEN"], "saved-token")
         self.assertEqual(env["TRELLO_LIST_ID"], SetupApi.list_id)
+        self.assertEqual(env["TRELLO_BOARD_URL"], "https://trello.com/b/board-short")
 
     def test_setup_does_not_write_env_when_board_authentication_fails(self):
         root = Path(tempfile.mkdtemp())

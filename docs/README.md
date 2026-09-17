@@ -6,7 +6,7 @@ Each copy of `sync.py` represents one Trello list. When the script runs, it crea
 
 Runtime version: `1.2.0`. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-The implementation is covered by 111 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
+The implementation is covered by 113 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
 
 ## Requirements
 
@@ -32,6 +32,8 @@ To configure credentials manually, fill in `.env`:
 ```dotenv
 TRELLO_API_KEY=your_api_key
 TRELLO_TOKEN=your_token
+# Optional setup-resume value; normal synchronization does not need it.
+TRELLO_BOARD_URL=https://trello.com/b/your-board
 TRELLO_LIST_ID=project_list_id
 ```
 
@@ -77,7 +79,7 @@ When API credentials are missing, the wizard points you to the Trello administra
 https://trello.com/1/authorize?expiration=never&scope=read%2Cwrite&response_type=token&key=YOUR_API_KEY
 ```
 
-If .env already contains SyncAssist settings, the wizard asks whether to continue with them or start over. Press Enter to continue (the default); valid saved API keys, tokens and list IDs are kept, and only missing or invalid settings are requested. A saved list ID skips the board URL and list selection. Enter n to restart all setup fields. The wizard updates only SyncAssist's three settings and preserves other .env entries.
+If .env already contains SyncAssist settings, the wizard asks whether to continue with them or start over. Press Enter to continue (the default); valid saved API keys, tokens, board URLs and list IDs are kept, and only missing or invalid settings are requested. A saved list ID skips the board URL and list selection. If the list ID is missing, the wizard reuses TRELLO_BOARD_URL when available. It saves the URL and current credentials after Trello confirms the board but before loading its lists, so rerunning --setup resumes at list selection. TRELLO_BOARD_URL is optional for normal synchronization. Enter n to restart all setup fields. The wizard preserves comments and unrelated .env entries.
 
 Setup also creates or updates `.gitignore` before saving credentials, adding `.env`, `PLAN/` and `sync.py` while preserving existing rules.
 
