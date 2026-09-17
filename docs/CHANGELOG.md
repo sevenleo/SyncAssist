@@ -1,10 +1,21 @@
 # Changelog
 
+## [1.2.1] - 2026-09-17
+
+### Documentation
+
+- Corrected the installation, CLI and exit-code guidance to match the setup and synchronization confirmation prompts.
+- Recorded the configuration and credential-protection updates that were missing from the 1.2.0 release notes.
+- Documentation-only update; the runtime version remains `1.2.0`.
+
 ## [1.2.0] - 2026-09-17
 
 ### Added
 
 - Excluded archived Trello cards from synchronization, moved existing local files to recovery, and recreated them from current data after unarchiving.
+- Required `TRELLO_BOARD_URL`, reused valid saved setup values, and saved a verified board URL before list selection so setup can resume. Existing `.env` content is preserved.
+- Made setup add `.env`, `PLAN/` and `sync.py` to `.gitignore` without replacing existing rules.
+- Checked all required settings before sync or import, asked before starting setup when settings are missing, and confirmed whether to start synchronization after setup.
 
 ## [1.1.1] - 2026-09-14
 

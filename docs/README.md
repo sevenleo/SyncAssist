@@ -37,13 +37,13 @@ TRELLO_BOARD_URL=https://trello.com/b/your-board
 TRELLO_LIST_ID=project_list_id
 ```
 
-The script uses the folder containing `sync.py` as the project root. If `.env` is missing, the first run starts the setup wizard automatically. This lets you run it from any directory:
+The script uses the folder containing `sync.py` as the project root. If `.env` is missing or required settings are incomplete, a normal run lists the missing values and asks before starting setup. After setup, it asks whether to start synchronization. This lets you run it from any directory:
 
 ```bash
 python sync.py
 ```
 
-After setup, synchronization runs without confirmation. A run with no changes returns `0` and does not rewrite cards or files.
+On subsequent runs with complete settings, synchronization runs without confirmation. A run with no changes returns `0` and does not rewrite cards or files.
 
 ## CLI quick reference
 
@@ -51,8 +51,8 @@ The script has no positional arguments. The recommended flow is to configure onc
 
 | Command | Use |
 | --- | --- |
-| `python sync.py --setup` | Create or resume `.env`, then run the first synchronization. |
-| `python sync.py` | Synchronize the configured Trello list and `PLAN/`; starts setup first if `.env` is missing. |
+| `python sync.py --setup` | Create or resume `.env`, then ask whether to start synchronization. |
+| `python sync.py` | Synchronize the configured Trello list and `PLAN/`; ask before setup if required settings are missing. |
 | `python sync.py --import` | Import immediate `PLAN/*.txt` files as todo cards, then synchronize. |
 | `python sync.py --help` | Show the complete operations, editable fields, recovery paths and exit codes. |
 | `python sync.py --version` | Show the runtime version. |
@@ -270,7 +270,7 @@ Markdown files without SyncAssist metadata are preserved and do not create cards
 | Code | Meaning |
 | --- | --- |
 | `0` | Synchronization completed or no changes found. |
-| `1` | Conflict, partial failure, lock, incomplete inventory or intervention required. |
+| `1` | Conflict, partial failure, lock, incomplete inventory, interruption or intervention required. |
 | `2` | Invalid configuration or usage. |
 | `3` | Global authentication or permission failure. |
 
