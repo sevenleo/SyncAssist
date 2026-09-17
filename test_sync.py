@@ -1085,6 +1085,31 @@ class SetupTests(unittest.TestCase):
         self.assertIn("visible", output)
         self.assertNotIn("secret-token", output)
         self.assertEqual(api.label_reads, 0)
+        self.assertEqual(
+            (root / ".gitignore").read_text(encoding="utf-8").splitlines(),
+            [".env", "PLAN/", "sync.py"],
+        )
+
+    def test_setup_preserves_gitignore_and_adds_missing_entries_once(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".env").write_text(
+            "TRELLO_API_KEY=api-key\n"
+            "TRELLO_TOKEN=secret-token\n"
+            "TRELLO_LIST_ID=abcdef1234567890abcdef34\n",
+            encoding="utf-8",
+        )
+        (root / ".gitignore").write_text("# Existing rules\ncustom/\n.env", encoding="utf-8")
+
+        result = run_setup(
+            root,
+            input_fn=lambda prompt: "",
+            output=io.StringIO(),
+            client_factory=lambda api_key, token: self.fail("saved list should skip remote setup calls"),
+        )
+
+        self.assertEqual(result, 0)
+        lines = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines, ["# Existing rules", "custom/", ".env", "PLAN/", "sync.py"])
 
     def test_setup_does_not_create_done_label_when_missing(self):
         root = Path(tempfile.mkdtemp())

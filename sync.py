@@ -831,6 +831,22 @@ def _setup_write_env(env_path: Path, values: Mapping[str, str]) -> None:
         pass
 
 
+def _setup_ensure_gitignore(gitignore_path: Path) -> None:
+    if gitignore_path.is_symlink():
+        raise ConfigError("refusing to update symlinked .gitignore")
+    if gitignore_path.exists() and not gitignore_path.is_file():
+        raise ConfigError(".gitignore path is not a regular file")
+
+    existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+    lines = existing.splitlines()
+    missing = [entry for entry in (".env", "PLAN/", "sync.py") if entry not in lines]
+    if missing:
+        with gitignore_path.open("a", encoding="utf-8", newline="\n") as handle:
+            if existing and not existing.endswith(("\n", "\r")):
+                handle.write("\n")
+            handle.writelines(f"{entry}\n" for entry in missing)
+
+
 def _setup_active_lists(lists: Iterable[Mapping[str, Any]], board_id: str) -> list[Mapping[str, Any]]:
     active: list[Mapping[str, Any]] = []
     for item in lists:
@@ -857,6 +873,7 @@ def run_setup(
 
     env_path = Path(project_root).resolve() / ".env"
     try:
+        _setup_ensure_gitignore(env_path.parent / ".gitignore")
         if secret_input_fn is None:
             secret_input_fn = input_fn
         existing = _setup_prepare_env(env_path, input_fn, output)

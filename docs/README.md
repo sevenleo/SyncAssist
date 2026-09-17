@@ -79,6 +79,8 @@ https://trello.com/1/authorize?expiration=never&scope=read%2Cwrite&response_type
 
 If .env already contains SyncAssist settings, the wizard asks whether to continue with them or start over. Press Enter to continue (the default); valid saved API keys, tokens and list IDs are kept, and only missing or invalid settings are requested. A saved list ID skips the board URL and list selection. Enter n to restart all setup fields. The wizard updates only SyncAssist's three settings and preserves other .env entries.
 
+Setup also creates or updates `.gitignore` before saving credentials, adding `.env`, `PLAN/` and `sync.py` while preserving existing rules.
+
 The token is requested with visible terminal input; verify the value before pressing Enter and avoid sharing the screen during setup. The **Secret** field in the Trello Auth tab is used by the OAuth 1.0 flow and is not the SyncAssist `TRELLO_TOKEN`. Because the wizard uses `response_type=token` without `return_url` or `callback_method`, **Allowed origins** does not need to be filled in.
 
 When a board URL is needed, the wizard lists its active lists for selection. It does not query, create or choose a completion label. Once setup completes, synchronization runs immediately. Cancellation or setup failure does not run sync.
