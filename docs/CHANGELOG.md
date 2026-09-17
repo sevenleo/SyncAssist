@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.0] - 2026-09-17
+
+### Added
+
+- Excluded archived Trello cards from synchronization, moved existing local files to recovery, and recreated them from current data after unarchiving.
+
 ## [1.1.1] - 2026-09-14
 
 ### Validation

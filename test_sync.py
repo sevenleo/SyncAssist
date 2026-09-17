@@ -935,8 +935,8 @@ class SetupTests(unittest.TestCase):
         ):
             self.assertIn(expected, help_text)
 
-    def test_product_version_is_one_one_one(self):
-        self.assertEqual(SCRIPT_VERSION, "1.1.1")
+    def test_product_version_matches_release(self):
+        self.assertEqual(SCRIPT_VERSION, "1.2.0")
 
     def test_main_runs_sync_after_successful_setup(self):
         config = object()
@@ -1780,6 +1780,106 @@ class SyncOnceTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             sync_once(config, api, now="2026-09-14T00:00:00Z")
         self.assertFalse((root / "PLAN" / "todo-card.md").exists())
+
+    def test_archived_card_is_not_imported_from_inventory(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        api.bundle["card"]["closed"] = True
+
+        report = sync_once(config, api, now="2026-09-14T00:00:00Z")
+
+        self.assertEqual(report["examined"], 0)
+        self.assertEqual(api.bundle_reads, 0)
+        self.assertFalse(plan_card_files(root))
+
+    def test_archived_card_fetched_after_inventory_is_not_imported(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        api.cards = [dict(api.bundle["card"])]
+        api.bundle["card"]["closed"] = True
+
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+
+        self.assertEqual(api.bundle_reads, 1)
+        self.assertFalse(plan_card_files(root))
+
+    def test_archive_detected_before_local_push_removes_file_without_remote_update(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        path = next_plan_card(root)
+        metadata = parse_document(path, path.read_text(encoding="utf-8")).metadata
+        metadata["content"]["description"] = "Local change"
+        path.write_text(render_document(metadata), encoding="utf-8")
+        original_get_bundle = api.get_card_bundle
+        refresh_reads = 0
+
+        def archive_on_refresh(card_id):
+            nonlocal refresh_reads
+            refresh_reads += 1
+            bundle = original_get_bundle(card_id)
+            if refresh_reads == 2:
+                bundle["card"]["closed"] = True
+            return bundle
+
+        api.get_card_bundle = archive_on_refresh
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertEqual(report["removed"], 1)
+        self.assertFalse(plan_card_files(root))
+        self.assertTrue(api.bundle["card"]["closed"])
+        self.assertFalse(api.updated)
+
+    def test_archiving_removes_card_until_unarchived_with_current_data(self):
+        for initial_status in ("todo", "done"):
+            with self.subTest(initial_status=initial_status):
+                root = Path(tempfile.mkdtemp())
+                config = self.make_config(root)
+                api = FakeApi(sample_bundle())
+                api.bundle["card"]["dueComplete"] = initial_status == "done"
+                sync_once(config, api, now="2026-09-14T00:00:00Z")
+                original_path = next_plan_card(root)
+                self.assertTrue(original_path.name.startswith(f"{initial_status}-"))
+
+                api.bundle["card"]["closed"] = True
+                archived_report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+                self.assertEqual(archived_report["removed"], 1)
+                self.assertFalse(plan_card_files(root))
+                recovered = list((root / "PLAN" / ".removed").glob("*.md"))
+                self.assertEqual(len(recovered), 1)
+                self.assertEqual(
+                    json.loads(recovered[0].with_suffix(".reason.json").read_text(encoding="utf-8"))["reason"],
+                    "card_archived",
+                )
+                self.assertTrue(api.bundle["card"]["closed"])
+
+                repeated_report = sync_once(config, api, now="2026-09-14T00:02:00Z")
+                self.assertEqual(repeated_report["removed"], 0)
+                self.assertFalse(plan_card_files(root))
+
+                restored_status = "done" if initial_status == "todo" else "todo"
+                api.bundle["card"].update(
+                    {
+                        "closed": False,
+                        "name": f"Returned {restored_status}",
+                        "desc": "Latest source data",
+                        "dueComplete": restored_status == "done",
+                    }
+                )
+                restored_report = sync_once(config, api, now="2026-09-14T00:03:00Z")
+
+                restored_path = next_plan_card(root)
+                self.assertEqual(restored_report["created"], 1)
+                self.assertEqual(restored_path.name, f"{restored_status}-returned-{restored_status}.md")
+                restored = parse_document(restored_path, restored_path.read_text(encoding="utf-8"))
+                self.assertEqual(restored.projection["description"], "Latest source data")
+                self.assertFalse(api.bundle["card"]["closed"])
+                self.assertFalse(api.updated)
 
     def test_pushes_local_edit_and_status_without_moving_card(self):
         root = Path(tempfile.mkdtemp())

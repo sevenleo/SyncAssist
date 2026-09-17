@@ -4,9 +4,9 @@ Local digital secretary for synchronizing a Trello list with a project's Markdow
 
 Each copy of `sync.py` represents one Trello list. When the script runs, it creates `PLAN/` and writes one file per card. The card ID is stored in the file's metadata, so title changes do not break the link.
 
-Runtime version: `1.1.1`. The implementation plan and its authorized disposable-list validation were completed on 2026-09-14. See [CHANGELOG.md](CHANGELOG.md) for the release history.
+Runtime version: `1.2.0`. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-The implementation is covered by 107 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
+The implementation is covered by 111 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
 
 ## Requirements
 
@@ -252,6 +252,8 @@ Cards that leave the configured list no longer belong to the project. The main f
 Deleting a local file does not delete the card. If the card is still in the list, the script recreates it on the next run using the current Trello state.
 
 Cards moved to another list or no longer accessible are removed from the active root and preserved in `PLAN/.removed/` with a `.reason.json` file. `PLAN/.conflicts/` stores conflict revisions and is not processed as cards.
+
+Archived Trello cards are excluded from synchronization. An existing active file is moved to `PLAN/.removed/` with reason `card_archived`; the next sync after unarchiving creates an active file from the current Trello data and status. Archiving does not change the Trello card.
 
 When a recovered card has an `import_source`, the new active document keeps that provenance without restoring the old TXT content automatically.
 
