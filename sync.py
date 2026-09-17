@@ -24,11 +24,12 @@ they can be tested without credentials or network access.
 #   --setup and --import are mutually exclusive; there are no positional args.
 #
 # Setup
-#   --setup asks for the key from https://trello.com/apps/admin (Power-Up
-#   Trello Auth tab), the User Token from its authorization link, a board URL
-#   and an active list. It writes TRELLO_API_KEY, TRELLO_TOKEN and
-#   TRELLO_LIST_ID to .env and runs the first synchronization. Keep the token
-#   private; an existing .env is replaced only after confirmation.
+#   --setup collects any missing key from https://trello.com/apps/admin
+#   (Power-Up Trello Auth tab), User Token from its authorization link, board
+#   URL and active list. It writes TRELLO_API_KEY, TRELLO_TOKEN and
+#   TRELLO_LIST_ID to .env and runs the first synchronization. Existing values
+#   continue by default; only missing settings are requested. Restart replaces
+#   setup values and preserves other .env entries. Keep the token private.
 #
 # Files and editing
 #   The folder containing this script is the project root. PLAN/ contains one
@@ -105,6 +106,11 @@ TRELLO_CARD_DESCRIPTION_LIMIT = 16384
 ProgressCallback = Callable[[str], None]
 
 
+def _valid_setup_credential(value: Any) -> bool:
+    value = str(value).strip()
+    return bool(value) and not any(char in value for char in "\r\n\"\\,")
+
+
 class SyncAssistError(Exception):
     """Base exception for expected SyncAssist failures."""
 
@@ -173,7 +179,7 @@ class Config:
                 raise ValueError(f"invalid Trello ID in {key}")
         for key in ("TRELLO_API_KEY", "TRELLO_TOKEN"):
             value = str(values[key]).strip()
-            if any(char in value for char in "\r\n\"\\,"):
+            if not _valid_setup_credential(value):
                 raise ValueError(f"invalid characters in {key}")
         return cls(
             api_key=str(values["TRELLO_API_KEY"]).strip(),
@@ -263,20 +269,20 @@ def _display_text(value: Any, fallback: str = "card") -> str:
 
 def _display_status(status: Any) -> str:
     if status == "novo":
-        return "NOVO"
-    return "CONCLUIDO" if status == "done" else "TODO"
+        return "NEW"
+    return "COMPLETED" if status == "done" else "TODO"
 
 
 def _display_conflict_reason(reason: Any) -> str:
     return {
-        "local_and_remote_changed": "alteracoes locais e remotas diferentes",
-        "remote_changed_before_resolution": "o Trello mudou antes da resolucao",
-        "stale_resolution": "a resolucao anterior ficou obsoleta",
-        "pending_remote_operation_requires_confirmation": "ha uma operacao remota pendente",
-        "local_read_only_section_changed": "conflito antigo somente leitura",
-        "card_moved_with_local_changes": "o card saiu da lista com alteracoes locais",
-        "card_absent_with_local_changes": "o card ficou inacessivel com alteracoes locais",
-        "file_changed_during_sync": "o arquivo mudou durante a consulta remota",
+        "local_and_remote_changed": "local and remote changes differ",
+        "remote_changed_before_resolution": "Trello changed before resolution",
+        "stale_resolution": "the previous resolution is stale",
+        "pending_remote_operation_requires_confirmation": "a remote operation is waiting for confirmation",
+        "local_read_only_section_changed": "legacy read-only section conflict",
+        "card_moved_with_local_changes": "card moved out of the list with local changes",
+        "card_absent_with_local_changes": "card is inaccessible and has local changes",
+        "file_changed_during_sync": "file changed during remote lookup",
     }.get(str(reason), str(reason))
 
 
@@ -357,7 +363,7 @@ class TrelloClient:
                 if wait_seconds > 0:
                     if wait_seconds >= 1:
                         self._progress(
-                            f"aguardando {wait_seconds:.1f}s entre consultas ao Trello..."
+                            f"Waiting {wait_seconds:.1f}s before the next Trello request..."
                         )
                     time.sleep(wait_seconds)
             self._last_request_started = time.monotonic()
@@ -377,14 +383,14 @@ class TrelloClient:
                     except ValueError:
                         wait_seconds = 10.0
                     self._progress(
-                        f"Trello pediu espera de {wait_seconds:.1f}s; tentando novamente..."
+                        f"Trello requested a {wait_seconds:.1f}s delay; retrying..."
                     )
                     time.sleep(wait_seconds)
                     continue
                 if status >= 500 and attempt + 1 < attempts and method.upper() in {"GET", "DELETE"}:
                     wait_seconds = 2**attempt
                     self._progress(
-                        f"Trello respondeu {status}; aguardando {wait_seconds}s para tentar novamente..."
+                        f"Trello returned {status}; retrying in {wait_seconds}s..."
                     )
                     time.sleep(wait_seconds)
                     continue
@@ -393,7 +399,7 @@ class TrelloClient:
                 if attempt + 1 < attempts and method.upper() == "GET":
                     wait_seconds = 2**attempt
                     self._progress(
-                        f"falha temporaria de rede; aguardando {wait_seconds}s para tentar novamente..."
+                        f"Temporary network failure; retrying in {wait_seconds}s..."
                     )
                     time.sleep(wait_seconds)
                     continue
@@ -754,7 +760,7 @@ def _setup_input(input_fn: Any, prompt: str) -> str:
 def _setup_credential(input_fn: Any, prompt: str, output: Any, field_name: str) -> str:
     while True:
         value = _setup_input(input_fn, prompt)
-        if value and not any(char in value for char in "\r\n\\\",\\"):
+        if _valid_setup_credential(value):
             return value
         print(f"{field_name} is invalid. Try again.", file=output)
 
@@ -771,29 +777,52 @@ def _setup_select(input_fn: Any, prompt: str, count: int, output: Any) -> int:
         print(f"Choose a number between 1 and {count}.", file=output)
 
 
-def _setup_prepare_env(env_path: Path, input_fn: Any, output: Any) -> None:
+def _setup_prepare_env(env_path: Path, input_fn: Any, output: Any) -> dict[str, str]:
     if env_path.is_symlink():
         raise ConfigError("refusing to replace symlinked .env")
     if env_path.exists() and not env_path.is_file():
         raise ConfigError(".env path is not a regular file")
     if not env_path.exists():
-        return
-    print(f"A .env file already exists at {env_path}.", file=output)
-    print("Setup will replace it entirely.", file=output)
-    answer = _setup_input(input_fn, "Replace .env? [y/N]: ")
-    if answer.casefold() not in {"y", "yes", "s", "sim"}:
+        return {}
+
+    existing = load_env(env_path)
+    if any(existing.get(key, "").strip() for key in ENV_KEYS):
+        print(f"SyncAssist settings already exist at {env_path}.", file=output)
+        while True:
+            answer = _setup_input(
+                input_fn,
+                "Continue with saved values or start from scratch? [Y/n]: ",
+            )
+            if answer.casefold() in {"", "y", "yes"}:
+                print("Continuing with saved settings.", file=output)
+                return existing
+            if answer.casefold() in {"n", "no"}:
+                print("Starting setup from scratch.", file=output)
+                return {}
+            print("Choose yes to continue or no to restart.", file=output)
+
+    print(f"An .env file already exists at {env_path}, but no SyncAssist settings are filled.", file=output)
+    print("Other .env entries will be preserved.", file=output)
+    answer = _setup_input(input_fn, "Continue setup? [y/N]: ")
+    if answer.casefold() not in {"y", "yes"}:
         raise SetupCancelled("setup cancelled")
+    return existing
 
 
 def _setup_write_env(env_path: Path, values: Mapping[str, str]) -> None:
+    if env_path.is_symlink():
+        raise ConfigError("refusing to replace symlinked .env")
+    if env_path.exists() and not env_path.is_file():
+        raise ConfigError(".env path is not a regular file")
     previous_mode: int | None = None
+    existing: dict[str, str] = {}
     if env_path.exists():
         previous_mode = stat.S_IMODE(env_path.stat().st_mode)
+        existing = load_env(env_path)
+    existing.update(values)
     text = (
         "# Generated by SyncAssist --setup. Keep this file private.\n"
-        f"TRELLO_API_KEY={values['TRELLO_API_KEY']}\n"
-        f"TRELLO_TOKEN={values['TRELLO_TOKEN']}\n"
-        f"TRELLO_LIST_ID={values['TRELLO_LIST_ID']}\n"
+        + "".join(f"{key}={value}\n" for key, value in existing.items())
     )
     _atomic_write(env_path, text)
     try:
@@ -830,57 +859,89 @@ def run_setup(
     try:
         if secret_input_fn is None:
             secret_input_fn = input_fn
-        _setup_prepare_env(env_path, input_fn, output)
-        print("Open the Trello administration page:", file=output)
-        print("https://trello.com/apps/admin", file=output)
-        print("Open your Power-Up, select the Trello Auth tab, and generate/copy the API Key.", file=output)
-        api_key = _setup_credential(input_fn, "Cole a API Key: ", output, "API Key")
-        print("Open this link to authorize and obtain the User Token:", file=output)
-        print(token_authorization_url(api_key), file=output)
-        print("Warning: the token will be visible while you type.", file=output)
-        token = _setup_credential(secret_input_fn, "Paste the User Token: ", output, "Token")
-        client = client_factory(api_key, token)
+        existing = _setup_prepare_env(env_path, input_fn, output)
 
-        while True:
-            board_url = _setup_input(input_fn, "Paste the Trello board URL: ")
-            try:
-                board_ref = parse_board_url(board_url)
-            except ValueError as exc:
-                print(f"Invalid URL: {exc}", file=output)
-                continue
-            try:
-                board_info = client.get_board(board_ref)
-            except RemoteError as exc:
-                if exc.status == 404:
-                    print("Board not found; enter another URL.", file=output)
-                    continue
-                raise
-            board_id = _trello_id(board_info)
-            if not ID_PATTERN.fullmatch(board_id):
-                raise RemoteError("Trello returned an invalid board ID")
-            if board_info.get("closed"):
-                raise ConfigError("configured Trello board is archived")
-            break
+        saved_api_key = existing.get("TRELLO_API_KEY", "").strip()
+        api_key = saved_api_key if _valid_setup_credential(saved_api_key) else ""
+        if api_key:
+            print("Reusing the saved API Key.", file=output)
+        else:
+            if saved_api_key:
+                print("The saved API Key is invalid; enter it again.", file=output)
+            print("Open the Trello administration page:", file=output)
+            print("https://trello.com/apps/admin", file=output)
+            print("Open your Power-Up, select the Trello Auth tab, and generate/copy the API Key.", file=output)
+            api_key = _setup_credential(input_fn, "Paste the API Key: ", output, "API Key")
 
-        lists = _setup_active_lists(client.get_board_lists(board_id), board_id)
-        if not lists:
-            raise ConfigError("Trello board has no active lists")
-        print(f"\nActive lists in {board_info.get('name') or board_id}:", file=output)
-        for index, item in enumerate(lists, start=1):
-            print(f"[{index}] {item.get('name') or '(unnamed)'} — {_trello_id(item)}", file=output)
-        selected_list = lists[_setup_select(input_fn, "Choose the project list: ", len(lists), output)]
-        list_id = _trello_id(selected_list)
-        _setup_write_env(
-            env_path,
-            {
-                "TRELLO_API_KEY": api_key,
-                "TRELLO_TOKEN": token,
-                "TRELLO_LIST_ID": list_id,
-            },
+        saved_token = existing.get("TRELLO_TOKEN", "").strip()
+        token = saved_token if _valid_setup_credential(saved_token) else ""
+        if token:
+            print("Reusing the saved User Token.", file=output)
+        else:
+            if saved_token:
+                print("The saved User Token is invalid; enter it again.", file=output)
+            print("Open this link to authorize and obtain the User Token:", file=output)
+            print(token_authorization_url(api_key), file=output)
+            print("Warning: the token will be visible while you type.", file=output)
+            token = _setup_credential(secret_input_fn, "Paste the User Token: ", output, "Token")
+
+        saved_list_id = existing.get("TRELLO_LIST_ID", "").strip()
+        list_id = saved_list_id if ID_PATTERN.fullmatch(saved_list_id) else ""
+        already_complete = bool(
+            _valid_setup_credential(existing.get("TRELLO_API_KEY", ""))
+            and _valid_setup_credential(existing.get("TRELLO_TOKEN", ""))
+            and ID_PATTERN.fullmatch(existing.get("TRELLO_LIST_ID", "").strip())
         )
+        selected_list_name = ""
+        if list_id:
+            print("Reusing the saved Trello list; board URL and list selection are skipped.", file=output)
+        else:
+            if saved_list_id:
+                print("The saved Trello list ID is invalid; select a list again.", file=output)
+            client = client_factory(api_key, token)
+            while True:
+                board_url = _setup_input(input_fn, "Paste the Trello board URL: ")
+                try:
+                    board_ref = parse_board_url(board_url)
+                except ValueError as exc:
+                    print(f"Invalid URL: {exc}", file=output)
+                    continue
+                try:
+                    board_info = client.get_board(board_ref)
+                except RemoteError as exc:
+                    if exc.status == 404:
+                        print("Board not found; enter another URL.", file=output)
+                        continue
+                    raise
+                board_id = _trello_id(board_info)
+                if not ID_PATTERN.fullmatch(board_id):
+                    raise RemoteError("Trello returned an invalid board ID")
+                if board_info.get("closed"):
+                    raise ConfigError("configured Trello board is archived")
+                break
+
+            lists = _setup_active_lists(client.get_board_lists(board_id), board_id)
+            if not lists:
+                raise ConfigError("Trello board has no active lists")
+            print(f"\nActive lists in {board_info.get('name') or board_id}:", file=output)
+            for index, item in enumerate(lists, start=1):
+                print(f"[{index}] {item.get('name') or '(unnamed)'} — {_trello_id(item)}", file=output)
+            selected_list = lists[_setup_select(input_fn, "Choose the project list: ", len(lists), output)]
+            list_id = _trello_id(selected_list)
+            selected_list_name = str(selected_list.get("name") or "")
+
+        if not already_complete:
+            _setup_write_env(
+                env_path,
+                {
+                    "TRELLO_API_KEY": api_key,
+                    "TRELLO_TOKEN": token,
+                    "TRELLO_LIST_ID": list_id,
+                },
+            )
         print("\nSetup completed.", file=output)
         print(f"File saved: {env_path}", file=output)
-        print(f"Selected list: {selected_list.get('name') or list_id}", file=output)
+        print(f"Selected list: {selected_list_name or list_id}", file=output)
         print("Completion status: Trello's native due-date checkbox", file=output)
         print("\nThe initial synchronization will run now.", file=output)
         return 0
@@ -1974,8 +2035,8 @@ def _clear_stale_read_only_conflict(
     )
     _emit_progress(
         progress,
-        f"conflito antigo somente leitura liberado em {parsed.path.name}; "
-        "o registro histórico em .conflicts foi mantido",
+        f"Legacy read-only conflict cleared in {parsed.path.name}; "
+        "its history in .conflicts was preserved",
     )
     return parse_document(parsed.path, parsed.path.read_text(encoding="utf-8"))
 
@@ -2314,11 +2375,11 @@ def _conflict_info(
         artifact_name = artifact.name
     _emit_progress(
         progress,
-        f"CONFLITO em {parsed.path.name} ({_display_text(remote_projection.get('title'))}) - "
+        f"CONFLICT in {parsed.path.name} ({_display_text(remote_projection.get('title'))}) - "
         f"local={_display_status(parsed.projection.get('status'))}; "
         f"Trello={_display_status(remote_projection.get('status'))}; "
-        f"{_display_conflict_reason(reason)}. Nada foi enviado. "
-        f"Artefato: {artifact_name}",
+        f"{_display_conflict_reason(reason)}. Nothing was sent. "
+        f"Artifact: {artifact_name}",
     )
     return conflict
 
@@ -3741,7 +3802,7 @@ def sync_once(
         raise SyncAssistError("refusing symlinked PLAN directory")
     config.plan_dir.mkdir(parents=True, exist_ok=True)
     with SyncLock(config.plan_dir, current_time):
-        _emit_progress(progress, "validando configuracao e inventario do Trello...")
+        _emit_progress(progress, "Validating configuration and Trello inventory...")
         _ensure_new_card_template(config.plan_dir)
         list_info, cards_by_id, labels_by_id = _validate_remote_scope(client, config)
         board_id = str(list_info["idBoard"])
@@ -3758,20 +3819,20 @@ def sync_once(
         report["examined"] = len(cards_by_id)
         _emit_progress(
             progress,
-            f"inventario pronto: {len(cards_by_id)} card(s) na lista; "
-            f"{len(local_documents)} arquivo(s) local(is)",
+            f"Inventory ready: {len(cards_by_id)} card(s) in the list; "
+            f"{len(local_documents)} local file(s)",
         )
         bundles: dict[str, Mapping[str, Any]] = {}
         card_ids = sorted(cards_by_id)
         if card_ids:
             _emit_progress(
                 progress,
-                f"lendo dados detalhados de {len(card_ids)} card(s); "
-                "as consultas ao Trello sao sequenciais...",
+                f"Reading details for {len(card_ids)} card(s); "
+                "Trello requests are sequential...",
             )
         for index, card_id in enumerate(card_ids, start=1):
             card_name = _display_text(cards_by_id[card_id].get("name"), card_id)
-            _emit_progress(progress, f"lendo card {index}/{len(card_ids)} - {card_name}...")
+            _emit_progress(progress, f"Reading card {index}/{len(card_ids)} - {card_name}...")
             try:
                 previous = local_documents.get(card_id)
                 bundle = copy.deepcopy(
@@ -3796,11 +3857,11 @@ def sync_once(
                 _report_error(report, card_id, f"remote card read failed: {type(exc).__name__}")
         created_card_ids: set[str] = set()
         if new_documents:
-            _emit_progress(progress, f"processando {len(new_documents)} novo(s) arquivo(s)...")
+            _emit_progress(progress, f"Processing {len(new_documents)} new file(s)...")
         for index, parsed in enumerate(new_documents, start=1):
             _emit_progress(
                 progress,
-                f"criando card novo {index}/{len(new_documents)} - "
+                f"Creating new card {index}/{len(new_documents)} - "
                 f"{_display_text(parsed.projection.get('title'))}...",
             )
             try:
@@ -3845,16 +3906,16 @@ def sync_once(
                 occupied_names.add(recovered_name.casefold())
         local_documents = _stage_filename_conflicts(config.plan_dir, local_documents, filenames)
         if bundles:
-            _emit_progress(progress, f"sincronizando {len(bundles)} card(s)...")
+            _emit_progress(progress, f"Syncing {len(bundles)} card(s)...")
         for index, card_id in enumerate(sorted(bundles), start=1):
             parsed = local_documents.get(card_id)
             remote_projection = build_remote_projection(bundles[card_id])
             local_status = parsed.projection.get("status") if parsed is not None else "novo"
             _emit_progress(
                 progress,
-                f"sincronizando card {index}/{len(bundles)} - "
+                f"Syncing card {index}/{len(bundles)} - "
                 f"{_display_text((bundles[card_id].get('card') or {}).get('name'), card_id)} "
-                f"(arquivo={_display_status(local_status)}, Trello={_display_status(remote_projection.get('status'))})...",
+                f"(file={_display_status(local_status)}, Trello={_display_status(remote_projection.get('status'))})...",
             )
             try:
                 _process_card(
@@ -3887,7 +3948,7 @@ def sync_once(
         if missing_documents:
             _emit_progress(
                 progress,
-                f"verificando {len(missing_documents)} card(s) que nao apareceram no inventario...",
+                f"Checking {len(missing_documents)} card(s) missing from the inventory...",
             )
         for card_id, parsed in missing_documents:
             try:
@@ -3951,7 +4012,7 @@ def sync_once(
         elapsed = time.monotonic() - started_at
         request_count = getattr(client, "request_count", None)
         request_note = f" ({request_count} consultas ao Trello)" if isinstance(request_count, int) else ""
-        _emit_progress(progress, f"sincronizacao concluida em {elapsed:.1f}s{request_note}.")
+        _emit_progress(progress, f"Synchronization completed in {elapsed:.1f}s{request_note}.")
         return report
 
 
@@ -4003,12 +4064,13 @@ def _exit_code(report: Mapping[str, Any]) -> int:
 CLI_HELP_EPILOG = """\
 Operations:
   python sync.py
-      Run one synchronization from .env. Reads the configured Trello list,
-      updates PLAN/*.md, and sends editable local changes to Trello.
+      Run one synchronization from .env. If .env is missing, setup starts
+      automatically before the configured Trello list is synchronized.
 
   python sync.py --setup
-      Interactively create or replace .env. Collects the API key, User Token,
-      board URL and active list, then runs the first synchronization.
+      Interactively create or resume .env. Existing values continue by
+      default; missing settings are collected before the first synchronization.
+      Answer no to restart. Other .env entries are preserved.
 
   python sync.py --import
       Convert only PLAN/*.txt files directly inside PLAN/ into new todo cards,
@@ -4018,7 +4080,7 @@ Operations:
       Print the SyncAssist version.
 
 Arguments:
-  --setup              Create or replace .env through the setup wizard.
+  --setup              Create or resume .env through the setup wizard.
   --import             Import immediate PLAN/*.txt files, then synchronize.
   --version            Print the version and exit.
   -h, --help           Print this reference and exit.
@@ -4075,7 +4137,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"SyncAssist {SCRIPT_VERSION}")
     modes = parser.add_mutually_exclusive_group()
-    modes.add_argument("--setup", action="store_true", help="interactively create or replace .env")
+    modes.add_argument("--setup", action="store_true", help="interactively create or resume .env")
     modes.add_argument(
         "--import",
         dest="import_tasks",
@@ -4089,19 +4151,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     project_root = Path(__file__).resolve().parent
+    env_path = project_root / ".env"
     try:
-        if args.setup:
+        if args.setup or not env_path.is_file():
+            if not args.setup:
+                _print_progress("SyncAssist: configuration file not found; starting setup...")
             setup_code = run_setup(project_root)
             if setup_code != 0:
                 return setup_code
-        _print_progress("SyncAssist: carregando configuracao...")
-        config = Config.from_file(project_root / ".env", project_root)
+        _print_progress("SyncAssist: Loading configuration...")
+        config = Config.from_file(env_path, project_root)
         if args.import_tasks:
-            _print_progress("SyncAssist: preparando arquivos TXT para importacao...")
+            _print_progress("SyncAssist: Preparing TXT files for import...")
         import_result = import_txt_tasks(config) if args.import_tasks else None
         report = sync_once(config, progress=_print_progress)
         if import_result is not None:
-            _print_progress("SyncAssist: finalizando importacoes confirmadas...")
+            _print_progress("SyncAssist: Finalizing confirmed imports...")
             finalize_imports(config, import_result)
             _print_import_report(import_result)
         _print_report(report)

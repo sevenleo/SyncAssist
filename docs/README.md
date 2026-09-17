@@ -6,7 +6,7 @@ Each copy of `sync.py` represents one Trello list. When the script runs, it crea
 
 Runtime version: `1.1.1`. The implementation plan and its authorized disposable-list validation were completed on 2026-09-14. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-The implementation is covered by 102 passing standard-library tests on Python 3.13.7. A full real validation also passed on the authorized disposable list `teste/projeto1` under Windows/PowerShell; no Linux or macOS environment was available here.
+The implementation is covered by 107 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ Trello uses tokens to authorize account access. Keep the token secret, never pas
 
 ## Install in a project
 
-Copy `sync.py` and `.env.example` to the project root and rename the `.env.example` copy to `.env`:
+Copy `sync.py` to the project root. You can configure credentials manually with `.env.example`, or let the setup wizard create `.env` on the first run:
 
 ```text
 my-project/
@@ -27,7 +27,7 @@ my-project/
 └── PLAN/
 ```
 
-Fill in `.env`:
+To configure credentials manually, fill in `.env`:
 
 ```dotenv
 TRELLO_API_KEY=your_api_key
@@ -35,13 +35,13 @@ TRELLO_TOKEN=your_token
 TRELLO_LIST_ID=project_list_id
 ```
 
-The script uses the folder containing `sync.py` as the project root. This lets you run it from any directory:
+The script uses the folder containing `sync.py` as the project root. If `.env` is missing, the first run starts the setup wizard automatically. This lets you run it from any directory:
 
 ```bash
 python sync.py
 ```
 
-The command is automatic and does not ask for confirmation. A run with no changes returns `0` and does not rewrite cards or files.
+After setup, synchronization runs without confirmation. A run with no changes returns `0` and does not rewrite cards or files.
 
 ## CLI quick reference
 
@@ -49,15 +49,15 @@ The script has no positional arguments. The recommended flow is to configure onc
 
 | Command | Use |
 | --- | --- |
-| `python sync.py --setup` | Create or replace `.env`, then run the first synchronization. |
-| `python sync.py` | Synchronize the configured Trello list and `PLAN/`. |
+| `python sync.py --setup` | Create or resume `.env`, then run the first synchronization. |
+| `python sync.py` | Synchronize the configured Trello list and `PLAN/`; starts setup first if `.env` is missing. |
 | `python sync.py --import` | Import immediate `PLAN/*.txt` files as todo cards, then synchronize. |
 | `python sync.py --help` | Show the complete operations, editable fields, recovery paths and exit codes. |
 | `python sync.py --version` | Show the runtime version. |
 
 `--setup` and `--import` are mutually exclusive. The full help is kept beside the implementation so it stays aligned with the actual CLI.
 
-During synchronization the terminal shows the current phase and card, for example `lendo card 2/5` and `sincronizando card 2/5`. The script reads complementary Trello resources sequentially to respect the API limit, so a card can require several requests. Rate-limit responses and retries are announced with the wait time, and the final line includes the elapsed time and number of Trello requests.
+During synchronization the terminal shows the current phase and card, for example `Reading card 2/5` and `Syncing card 2/5`. The script reads complementary Trello resources sequentially to respect the API limit, so a card can require several requests. Rate-limit responses and retries are announced with the wait time, and the final line includes the elapsed time and number of Trello requests.
 
 The raw reference keeps the card, list, board, labels, checklists/items, actions, attachments, members, custom-field values and definitions, votes, stickers and Power-Up data when the API exposes them. Each complementary resource has a `complete`, `empty`, `unsupported` or `failed` status. A transient or failed resource is never silently replaced with an empty list: the previous section is retained when available, the card is not rewritten from that incomplete bundle, and cleanup is disabled for the run. A 403/404 optional endpoint is recorded as unsupported and does not block unrelated cards.
 
@@ -65,21 +65,23 @@ The template `.gitignore` also ignores `PLAN/`, because its documents may contai
 
 ## Guided setup
 
-To create or replace `.env` interactively, run this from the project root:
+To create or resume `.env` interactively, run this from the project root:
 
 ```bash
 python sync.py --setup
 ```
 
-The wizard points you to the Trello administration page, where the API Key is available in the Power-Up's **Trello Auth** tab. It then displays the User Token authorization link:
+When API credentials are missing, the wizard points you to the Trello administration page, where the API Key is available in the Power-Up's **Trello Auth** tab. When the User Token is missing, it displays the authorization link:
 
 ```text
 https://trello.com/1/authorize?expiration=never&scope=read%2Cwrite&response_type=token&key=YOUR_API_KEY
 ```
 
+If .env already contains SyncAssist settings, the wizard asks whether to continue with them or start over. Press Enter to continue (the default); valid saved API keys, tokens and list IDs are kept, and only missing or invalid settings are requested. A saved list ID skips the board URL and list selection. Enter n to restart all setup fields. The wizard updates only SyncAssist's three settings and preserves other .env entries.
+
 The token is requested with visible terminal input; verify the value before pressing Enter and avoid sharing the screen during setup. The **Secret** field in the Trello Auth tab is used by the OAuth 1.0 flow and is not the SyncAssist `TRELLO_TOKEN`. Because the wizard uses `response_type=token` without `return_url` or `callback_method`, **Allowed origins** does not need to be filled in.
 
-After receiving the board URL, the wizard lists active lists for selection. It does not query, create or choose a completion label. Setup replaces an existing `.env` only after confirmation and, when complete, immediately runs synchronization to reflect current tasks. Cancellation or setup failure does not run sync.
+When a board URL is needed, the wizard lists its active lists for selection. It does not query, create or choose a completion label. Once setup completes, synchronization runs immediately. Cancellation or setup failure does not run sync.
 
 ## Import TXT tasks
 
@@ -131,7 +133,7 @@ To create a new task:
 3. If necessary, adjust checklists and `content.label_ids` in the technical block, using only IDs that exist on the board.
 4. Run `python sync.py`.
 
-Exemplo:
+Example:
 
 ```bash
 cp PLAN/_modelo-card.md PLAN/todo-publish-documentation.md
@@ -144,7 +146,7 @@ The copied file is recognized by the `role: template` metadata. The script creat
 
 The file starts with a human-readable summary: title, description, status, due date and card link. The comment count appears in the comments section heading later in the document. The technical JSON block is at the end inside an HTML comment and contains the identity and snapshots used for synchronization.
 
-Exemplo estrutural completo (o bloco técnico é gerado pelo script; os hashes abaixo são ilustrativos):
+Complete structural example (the script generates the technical block; the hashes below are illustrative):
 
 ```markdown
 # People
@@ -217,7 +219,7 @@ To preserve subtask identity:
 - Use temporary IDs `new:<key>` for new checklists and items.
 - Heading and item order is the intended order; existing items can be moved between checklists while keeping their IDs.
 
-Exemplo:
+Example:
 
 ```markdown
 ### Validation <!-- syncassist:checklist=000000000000000000000001 -->

@@ -713,7 +713,7 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(result["id"], "abcdef1234567890abcdef56")
         self.assertEqual(len(calls), 2)
-        self.assertIn("Trello pediu espera de 2.0s", messages[0])
+        self.assertIn("Trello requested a 2.0s delay", messages[0])
         self.assertNotIn("key", messages[0])
         self.assertNotIn("token", messages[0])
         sleep.assert_any_call(2.0)
@@ -927,6 +927,8 @@ class SetupTests(unittest.TestCase):
             "python sync.py --setup",
             "python sync.py --import",
             "python sync.py --version",
+            "Existing values continue by",
+            "Answer no to restart",
             "No positional arguments are accepted",
             "PLAN/.conflicts/",
             "Exit codes:",
@@ -952,6 +954,20 @@ class SetupTests(unittest.TestCase):
         self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
         print_report.assert_called_once_with(report)
 
+    def test_main_starts_setup_automatically_when_env_is_missing(self):
+        config = object()
+        report = {"failures": 0, "conflicts": 0}
+        with mock.patch("sync.Path.is_file", return_value=False), \
+                mock.patch("sync.run_setup", return_value=0) as setup, \
+                mock.patch("sync.Config.from_file", return_value=config) as load_config, \
+                mock.patch("sync.sync_once", return_value=report) as sync_call, \
+                mock.patch("sync._print_report"):
+            self.assertEqual(main([]), 0)
+
+        setup.assert_called_once()
+        load_config.assert_called_once()
+        sync_call.assert_called_once()
+
     def test_main_does_not_sync_when_setup_is_cancelled(self):
         with mock.patch("sync.run_setup", return_value=1) as setup, \
                 mock.patch("sync.Config.from_file") as load_config, \
@@ -966,7 +982,8 @@ class SetupTests(unittest.TestCase):
         config = object()
         import_result = mock.Mock(errors=[], failed=0)
         report = {"failures": 0, "conflicts": 0}
-        with mock.patch("sync.Config.from_file", return_value=config), \
+        with mock.patch("sync.Path.is_file", return_value=True), \
+                mock.patch("sync.Config.from_file", return_value=config), \
                 mock.patch("sync.import_txt_tasks", return_value=import_result) as import_tasks, \
                 mock.patch("sync.sync_once", return_value=report) as sync_call, \
                 mock.patch("sync.finalize_imports") as finalize, \
@@ -985,13 +1002,16 @@ class SetupTests(unittest.TestCase):
     def test_main_without_flags_keeps_the_normal_sync_path(self):
         config = object()
         report = {"failures": 0, "conflicts": 0}
-        with mock.patch("sync.Config.from_file", return_value=config), \
+        with mock.patch("sync.Path.is_file", return_value=True), \
+                mock.patch("sync.run_setup") as setup, \
+                mock.patch("sync.Config.from_file", return_value=config), \
                 mock.patch("sync.import_txt_tasks") as import_tasks, \
                 mock.patch("sync.sync_once", return_value=report) as sync_call, \
                 mock.patch("sync._print_report") as print_report:
             self.assertEqual(main([]), 0)
 
         import_tasks.assert_not_called()
+        setup.assert_not_called()
         sync_call.assert_called_once()
         self.assertIs(sync_call.call_args.args[0], config)
         self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
@@ -1110,33 +1130,180 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(api.label_reads, 0)
         self.assertNotIn("TRELLO_DONE_LABEL_ID", (root / ".env").read_text(encoding="utf-8"))
 
-    def test_setup_declines_replacing_existing_env_before_remote_calls(self):
+    def test_setup_continues_complete_env_by_default_without_reprompting(self):
         root = Path(tempfile.mkdtemp())
-        original = "TRELLO_API_KEY=old\nTRELLO_TOKEN=old\n"
+        original = (
+            "# Keep this file private.\n"
+            "OTHER_SETTING=keep-me\n"
+            "TRELLO_API_KEY=api-key\n"
+            "TRELLO_TOKEN=token\n"
+            "TRELLO_LIST_ID=abcdef1234567890abcdef34\n"
+        )
         (root / ".env").write_text(original, encoding="utf-8")
         output = io.StringIO()
+        prompts = []
+
+        def visible_input(prompt):
+            prompts.append(prompt)
+            return ""
+
         result = run_setup(
             root,
-            input_fn=lambda prompt: "n" if "replace" in prompt.lower() else self.fail("remote call should not happen"),
-            secret_input_fn=lambda prompt: self.fail("remote call should not happen"),
+            input_fn=visible_input,
+            secret_input_fn=lambda prompt: self.fail("saved token should be reused"),
             output=output,
-            client_factory=lambda api_key, token: self.fail("remote call should not happen"),
-        )
-        self.assertEqual(result, 1)
-        self.assertEqual((root / ".env").read_text(encoding="utf-8"), original)
-
-    def test_setup_confirms_replacing_existing_env(self):
-        root = Path(tempfile.mkdtemp())
-        (root / ".env").write_text("old", encoding="utf-8")
-        api = SetupApi(labels=[{"id": "abcdef1234567890abcdef56", "idBoard": SetupApi.board_id, "name": "Done", "color": "green"}])
-        result, _ = self.setup_inputs(
-            root,
-            api,
-            ["y", "api-key", "https://trello.com/b/board-short", "1"],
-            ["secret-token"],
+            client_factory=lambda api_key, token: self.fail("saved list should skip remote setup calls"),
         )
         self.assertEqual(result, 0)
-        self.assertIn("TRELLO_API_KEY=api-key", (root / ".env").read_text(encoding="utf-8"))
+        self.assertEqual(prompts, ["Continue with saved values or start from scratch? [Y/n]: "])
+        self.assertEqual((root / ".env").read_text(encoding="utf-8"), original)
+        self.assertIn("Reusing the saved API Key.", output.getvalue())
+        self.assertIn("Reusing the saved User Token.", output.getvalue())
+        self.assertIn("board URL and list selection are skipped", output.getvalue())
+
+    def test_setup_continues_partial_env_and_only_prompts_for_missing_list(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".env").write_text(
+            "# Keep this comment.\n"
+            "OTHER_SETTING=keep-me\n"
+            "TRELLO_API_KEY=saved-api\n"
+            "TRELLO_TOKEN=saved-token\n",
+            encoding="utf-8",
+        )
+        api = SetupApi()
+        values = iter(["", "https://trello.com/b/board-short", "2"])
+        prompts = []
+        output = io.StringIO()
+
+        def visible_input(prompt):
+            prompts.append(prompt)
+            return next(values)
+
+        result = run_setup(
+            root,
+            input_fn=visible_input,
+            secret_input_fn=lambda prompt: self.fail("saved token should be reused"),
+            output=output,
+            client_factory=lambda api_key, token: (
+                api if (api_key, token) == ("saved-api", "saved-token")
+                else self.fail("saved credentials should be reused")
+            ),
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            prompts,
+            [
+                "Continue with saved values or start from scratch? [Y/n]: ",
+                "Paste the Trello board URL: ",
+                "Choose the project list: ",
+            ],
+        )
+        env = parse_env_text((root / ".env").read_text(encoding="utf-8"))
+        self.assertEqual(env["TRELLO_API_KEY"], "saved-api")
+        self.assertEqual(env["TRELLO_TOKEN"], "saved-token")
+        self.assertEqual(env["TRELLO_LIST_ID"], "abcdef1234567890abcdef56")
+        self.assertEqual(env["OTHER_SETTING"], "keep-me")
+
+    def test_setup_continues_saved_list_and_only_prompts_for_missing_token(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".env").write_text(
+            "TRELLO_API_KEY=saved-api\n"
+            "TRELLO_LIST_ID=abcdef1234567890abcdef34\n"
+            "OTHER_SETTING=keep-me\n",
+            encoding="utf-8",
+        )
+        prompts = []
+        secret_prompts = []
+        output = io.StringIO()
+
+        def visible_input(prompt):
+            prompts.append(prompt)
+            return ""
+
+        result = run_setup(
+            root,
+            input_fn=visible_input,
+            secret_input_fn=lambda prompt: (secret_prompts.append(prompt) or "new-token"),
+            output=output,
+            client_factory=lambda api_key, token: self.fail("saved list should skip board lookup"),
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(prompts, ["Continue with saved values or start from scratch? [Y/n]: "])
+        self.assertEqual(secret_prompts, ["Paste the User Token: "])
+        env = parse_env_text((root / ".env").read_text(encoding="utf-8"))
+        self.assertEqual(env["TRELLO_API_KEY"], "saved-api")
+        self.assertEqual(env["TRELLO_TOKEN"], "new-token")
+        self.assertEqual(env["TRELLO_LIST_ID"], "abcdef1234567890abcdef34")
+        self.assertEqual(env["OTHER_SETTING"], "keep-me")
+
+    def test_setup_restarts_saved_values_when_user_says_no(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".env").write_text(
+            "OTHER_SETTING=keep-me\n"
+            "TRELLO_API_KEY=old-api\n"
+            "TRELLO_TOKEN=old-token\n"
+            "TRELLO_LIST_ID=abcdef1234567890abcdef78\n",
+            encoding="utf-8",
+        )
+        api = SetupApi()
+        result, output = self.setup_inputs(
+            root,
+            api,
+            ["n", "new-api", "https://trello.com/b/board-short", "1"],
+            ["new-token"],
+        )
+        self.assertEqual(result, 0)
+        env = parse_env_text((root / ".env").read_text(encoding="utf-8"))
+        self.assertEqual(env["TRELLO_API_KEY"], "new-api")
+        self.assertEqual(env["TRELLO_TOKEN"], "new-token")
+        self.assertEqual(env["TRELLO_LIST_ID"], SetupApi.list_id)
+        self.assertEqual(env["OTHER_SETTING"], "keep-me")
+        self.assertIn("Starting setup from scratch.", output)
+        self.assertNotIn("Reusing the saved API Key.", output)
+
+    def test_setup_reasks_for_invalid_saved_api_key_and_list_id(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".env").write_text(
+            "TRELLO_API_KEY=invalid,api\n"
+            "TRELLO_TOKEN=saved-token\n"
+            "TRELLO_LIST_ID=not-a-trello-id\n",
+            encoding="utf-8",
+        )
+        prompts = []
+        values = iter(["", "new-api", "https://trello.com/b/board-short", "1"])
+        output = io.StringIO()
+        api = SetupApi()
+
+        def visible_input(prompt):
+            prompts.append(prompt)
+            return next(values)
+
+        result = run_setup(
+            root,
+            input_fn=visible_input,
+            secret_input_fn=lambda prompt: self.fail("valid saved token should be reused"),
+            output=output,
+            client_factory=lambda api_key, token: (
+                api if (api_key, token) == ("new-api", "saved-token")
+                else self.fail("new API key and saved token should be used")
+            ),
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            prompts,
+            [
+                "Continue with saved values or start from scratch? [Y/n]: ",
+                "Paste the API Key: ",
+                "Paste the Trello board URL: ",
+                "Choose the project list: ",
+            ],
+        )
+        self.assertIn("The saved API Key is invalid; enter it again.", output.getvalue())
+        self.assertIn("The saved Trello list ID is invalid; select a list again.", output.getvalue())
+        env = parse_env_text((root / ".env").read_text(encoding="utf-8"))
+        self.assertEqual(env["TRELLO_API_KEY"], "new-api")
+        self.assertEqual(env["TRELLO_TOKEN"], "saved-token")
+        self.assertEqual(env["TRELLO_LIST_ID"], SetupApi.list_id)
 
     def test_setup_does_not_write_env_when_board_authentication_fails(self):
         root = Path(tempfile.mkdtemp())
@@ -1714,11 +1881,11 @@ class SyncOnceTests(unittest.TestCase):
         self.assertFalse(api.updated)
         self.assertEqual(report["conflicts"], 1)
         self.assertEqual(len(list((root / "PLAN" / ".conflicts").glob("*.md"))), 1)
-        conflict_message = next(message for message in messages if "CONFLITO" in message)
+        conflict_message = next(message for message in messages if "CONFLICT" in message)
         self.assertIn("local=TODO", conflict_message)
         self.assertIn("Trello=TODO", conflict_message)
-        self.assertIn("Nada foi enviado", conflict_message)
-        self.assertIn("Artefato: .conflicts", conflict_message)
+        self.assertIn("Nothing was sent", conflict_message)
+        self.assertIn("Artifact: .conflicts", conflict_message)
 
     def test_recreates_a_deleted_conflict_artifact_without_overwriting_the_card(self):
         root = Path(tempfile.mkdtemp())
@@ -1867,11 +2034,11 @@ class SyncOnceTests(unittest.TestCase):
 
         sync_once(config, api, now="2026-09-14T00:00:00Z", progress=messages.append)
 
-        self.assertIn("validando configuracao e inventario", messages[0])
-        self.assertTrue(any("inventario pronto" in message for message in messages))
-        self.assertTrue(any("lendo card 1/1" in message for message in messages))
-        self.assertTrue(any("sincronizando card 1/1" in message for message in messages))
-        self.assertTrue(any("sincronizacao concluida em" in message for message in messages))
+        self.assertIn("Validating configuration and Trello inventory", messages[0])
+        self.assertTrue(any("Inventory ready" in message for message in messages))
+        self.assertTrue(any("Reading card 1/1" in message for message in messages))
+        self.assertTrue(any("Syncing card 1/1" in message for message in messages))
+        self.assertTrue(any("Synchronization completed in" in message for message in messages))
 
     def test_stale_read_only_conflict_does_not_block_remote_status(self):
         root = Path(tempfile.mkdtemp())
@@ -1912,7 +2079,7 @@ class SyncOnceTests(unittest.TestCase):
             (root / "PLAN" / "done-card.md").read_text(encoding="utf-8"),
         )
         self.assertIsNone(final.metadata["sync"].get("conflict"))
-        self.assertTrue(any("conflito antigo somente leitura liberado" in message for message in messages))
+        self.assertTrue(any("Legacy read-only conflict cleared" in message for message in messages))
 
     def test_updates_existing_checklist_item_without_recreating_it(self):
         root = Path(tempfile.mkdtemp())
