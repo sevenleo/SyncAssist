@@ -4,9 +4,9 @@ Local digital secretary for synchronizing a Trello list with a project's Markdow
 
 Each copy of `sync.py` represents one Trello list. When the script runs, it creates `PLAN/` and writes one file per card. The card ID is stored in the file's metadata, so title changes do not break the link.
 
-Runtime version: `1.2.4`. See [CHANGELOG.md](CHANGELOG.md) for the release history.
+Runtime version: `1.3.0`. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-The implementation is covered by 123 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
+The implementation is covered by 130 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
 
 ## Requirements
 
@@ -47,13 +47,13 @@ On subsequent runs with complete settings, synchronization runs without confirma
 
 ## CLI quick reference
 
-The script has no positional arguments. The recommended flow is to configure once, use the normal sync for daily work, and use TXT import only when needed:
+The script has no positional arguments. The normal run converts `todo-*.txt` tasks in `PLAN/` before synchronization. Use `--import` to also convert other immediate TXT files before the same synchronization:
 
 | Command | Use |
 | --- | --- |
 | `python sync.py --setup` | Create or resume `.env`, then ask whether to start synchronization. |
-| `python sync.py` | Synchronize the configured Trello list and `PLAN/`; ask before setup if required settings are missing. |
-| `python sync.py --import` | Import immediate `PLAN/*.txt` files as todo cards, then synchronize. |
+| `python sync.py` | Convert `PLAN/todo-*.txt` to Markdown cards, then synchronize; ask before setup if settings are missing. |
+| `python sync.py --import` | Convert immediate `PLAN/*.txt` files to local Markdown cards, then synchronize. |
 | `python sync.py --help` | Show the complete operations, editable fields, recovery paths and exit codes. |
 | `python sync.py --version` | Show the runtime version. |
 
@@ -65,7 +65,7 @@ When a card fails, the report includes its ID and title, the detailed Trello or 
 
 The raw reference keeps the card, list, board, labels, checklists/items, actions, attachments, members, custom-field values and definitions, votes, stickers and Power-Up data when the API exposes them. Each complementary resource has a `complete`, `empty`, `unsupported` or `failed` status. A transient or failed resource is never silently replaced with an empty list: the previous section is retained when available, the card is not rewritten from that incomplete bundle, and cleanup is disabled for the run. A 403/404 optional endpoint is recorded as unsupported and does not block unrelated cards.
 
-The template `.gitignore` also ignores `PLAN/`, because its documents may contain private Trello data. If the project needs to version these plans, remove that rule deliberately and also review `.conflicts/` and `.removed/`. The script does not remove already-versioned private files from the index or rewrite Git history.
+The template `.gitignore` also ignores `PLAN/`, because its documents may contain private Trello data. If the project needs to version these plans, remove that rule deliberately and also review `.converted/`, `.conflicts/` and `.removed/`. The script does not remove already-versioned private files from the index or rewrite Git history.
 
 ## Guided setup
 
@@ -87,27 +87,25 @@ Setup also creates or updates `.gitignore` before saving credentials, adding `.e
 
 The token is requested with visible terminal input; verify the value before pressing Enter and avoid sharing the screen during setup. The **Secret** field in the Trello Auth tab is used by the OAuth 1.0 flow and is not the SyncAssist `TRELLO_TOKEN`. Because the wizard uses `response_type=token` without `return_url` or `callback_method`, **Allowed origins** does not need to be filled in.
 
-When the board URL is needed, the wizard lists the board's active lists for selection. It does not query, create or choose a completion label. Starting `sync.py` checks every required env value before any synchronization or import work. If values are missing, it lists their names and asks whether to run setup; declining exits without changing files. After setup completes, it asks whether to start synchronization. Cancellation or setup failure does not run sync.
+When the board URL is needed, the wizard lists the board's active lists for selection. It does not query, create or choose a completion label. A normal run first converts local `todo-*.txt` files, then checks every required env value before remote synchronization. If values are missing, it lists their names and asks whether to run setup. After setup completes, it asks whether to start synchronization. Cancellation or setup failure does not run sync, but any local TXT conversion already completed is preserved.
 
-## Import TXT tasks
+## Create cards from TXT tasks
 
-To convert text files into new Trello todo cards and then run the normal synchronization, use:
+For a task that should be synchronized on the next normal run, create a plain text description in `PLAN/` using the `todo-` filename prefix:
+
+```text
+PLAN/todo-tarefa.txt
+```
+
+On the next `python sync.py`, SyncAssist creates `PLAN/todo-tarefa.md` before synchronization. The filename (without `todo-`) becomes the title, the complete TXT body becomes the description, and all other card fields use their minimum defaults (no labels or checklists). After the Markdown card is saved, the source moves to `PLAN/.converted/todo-tarefa.txt`; normal synchronization then creates the Trello card.
+
+To convert any immediate `PLAN/*.txt` files into Markdown cards and synchronize them, run:
 
 ```bash
 python sync.py --import
 ```
 
-The command scans only `.txt` files directly inside `PLAN/`. It does not scan subdirectories, including `PLAN/.imported/`. For each valid file:
-
-- the complete text becomes the card description;
-- the title is the first 60 characters after whitespace and line-break normalization;
-- a `todo-*.md` template is created using the existing card format;
-- the normal synchronization creates the Trello card;
-- the source TXT is moved to `PLAN/.imported/` only after the card ID is confirmed locally.
-
-Empty files, invalid UTF-8 files and other invalid sources remain in `PLAN/` and are reported. Other valid files continue to be processed after an individual failure. Existing Markdown files are never overwritten; filename collisions receive a deterministic import suffix. Running the command again is idempotent for a source with the same path and content hash.
-
-The command always runs the regular synchronization after the import phase, even when no TXT files are found. `--setup` and `--import` are mutually exclusive. The import mode does not expose tokens or card contents in its error output.
+The conversion reads only immediate children of `PLAN/`, never subdirectories. Empty files, invalid UTF-8 files, unsafe paths and files without a usable title remain in place and are reported. Other valid files continue after an individual failure. Existing Markdown files are never overwritten; collisions receive a deterministic suffix. Successfully converted TXT sources move to `PLAN/.converted/` as soon as their local Markdown card exists, before Trello synchronization begins. If synchronization is unavailable, the local card remains ready for a later normal run. Repeating the command is safe for a source with the same path and content hash.
 
 ## How status works
 
@@ -300,7 +298,7 @@ python teste\sync.py
 python teste\sync.py --import
 ```
 
-Use only a Trello list dedicated to testing. Inspect the summary, `teste/PLAN/.conflicts`, `teste/PLAN/.removed` and `teste/PLAN/.imported` after each scenario.
+Use only a Trello list dedicated to testing. Inspect the summary, `teste/PLAN/.conflicts`, `teste/PLAN/.removed` and `teste/PLAN/.converted` after each scenario.
 
 ## Deliberate limitations
 

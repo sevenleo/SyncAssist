@@ -13,15 +13,15 @@ they can be tested without credentials or network access.
 #   3. Copy PLAN/_modelo-card.md to a `todo-*.md` or `done-*.md` file and edit
 #      its title, description, checklists or valid label IDs.
 #   4. Run `python sync.py` after local or Trello changes.
-#   5. Use `python sync.py --import` only for new .txt files directly in PLAN/.
+#   5. Drop a `todo-*.txt` in PLAN/ for automatic conversion before sync.
 #
 # CLI
 #   python sync.py          Normal synchronization; PLAN/ is created as needed.
 #   python sync.py --setup  Interactive .env setup, followed by a sync confirmation.
-#   python sync.py --import Import PLAN/*.txt as todo cards, followed by sync.
+#   python sync.py --import Convert PLAN/*.txt, then synchronize.
 #   python sync.py --help   Show the complete command and file reference.
 #   python sync.py --version
-#   --setup and --import are mutually exclusive; there are no positional args.
+#   --setup and --import are mutually exclusive.
 #
 # Setup
 #   --setup collects any missing key from https://trello.com/apps/admin
@@ -42,13 +42,14 @@ they can be tested without credentials or network access.
 #   read-only/reference data. Preserve existing IDs and syncassist markers.
 #
 # Import and recovery
-#   --import reads only immediate PLAN/*.txt, uses the complete text as the
-#   description and moves confirmed sources to PLAN/.imported/. Invalid files
-#   remain in PLAN/. Conflicts and removed cards are preserved in
+#   --import reads immediate PLAN/*.txt; normal runs automatically convert
+#   PLAN/todo-*.txt before synchronization. Sources move to PLAN/.converted/
+#   after the Markdown card is saved. Invalid files remain in PLAN/.
+#   Conflicts and removed cards are preserved in
 #   PLAN/.conflicts/ and PLAN/.removed/ for review.
 #
 # Boundaries
-#   Only a valid template copy or --import creates a card. SyncAssist does not
+#   Only a valid template copy or TXT import creates a card. SyncAssist does not
 #   move, delete or archive Trello cards, edit comments/read-only data, or
 #   download attachments. Never commit .env or expose tokens. See `--help` for exit
 #   codes and the conflict-resolution flow.
@@ -79,7 +80,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 
-SCRIPT_VERSION = "1.2.5"
+SCRIPT_VERSION = "1.3.0"
 SCHEMA_VERSION = 1
 TEMPLATE_INSTRUCTIONS_VERSION = 2
 API_BASE = "https://api.trello.com/1"
@@ -1954,7 +1955,7 @@ class ImportSource:
 class ImportResult:
     sources: list[ImportSource] = field(default_factory=list)
     prepared: int = 0
-    imported: int = 0
+    converted: int = 0
     skipped: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
@@ -1964,8 +1965,10 @@ def _normalise_import_text(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _import_title(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()[:60]
+def _import_title(source: ImportSource) -> str:
+    stem = Path(source.relative_path).stem
+    title = re.sub(r"^(?:todo|done)-", "", stem, flags=re.IGNORECASE)
+    return re.sub(r"[-_\s]+", " ", title).strip()[:60]
 
 
 def _import_digest(text: str) -> str:
@@ -1997,14 +2000,16 @@ def _find_import_document(plan_dir: Path, source: ImportSource) -> ParsedDocumen
 
 def _import_filename_candidates(plan_dir: Path, source: ImportSource) -> Iterable[Path]:
     stem = Path(source.relative_path).stem
-    visible_stem = _visible_title_for_slug(stem).strip()
-    slug = slugify_title(stem)
+    status = "done" if stem.casefold().startswith("done-") else "todo"
+    task_stem = re.sub(r"^(?:todo|done)-", "", stem, flags=re.IGNORECASE)
+    visible_stem = _visible_title_for_slug(task_stem).strip()
+    slug = slugify_title(task_stem)
     if slug == "card" and (
         not any(character.isalnum() for character in visible_stem)
         or visible_stem.upper() in RESERVED_WINDOWS_NAMES
     ):
         slug = f"imported-{source.digest[:8]}"
-    base = f"todo-{slug}"
+    base = f"{status}-{slug}"
     yield plan_dir / f"{base}.md"
     for length in (8, 12, 16, 24):
         yield plan_dir / f"{base}-import-{source.digest[:length]}.md"
@@ -2026,17 +2031,19 @@ def _allocate_import_document_path(plan_dir: Path, source: ImportSource) -> Path
 
 
 def _import_template_metadata(source: ImportSource, title: str, description: str, filename: str) -> dict[str, Any]:
+    status = "done" if filename.casefold().startswith("done-") else "todo"
+    slug = re.sub(r"^(?:todo|done)-", "", Path(filename).stem, flags=re.IGNORECASE)
     return {
         "managed_by": "syncassist",
         "schema_version": SCHEMA_VERSION,
         "role": "template",
         "section_token": secrets.token_hex(8),
-        "status": "todo",
-        "filename": {"slug": Path(filename).stem.removeprefix("todo-"), "suffix": ""},
+        "status": status,
+        "filename": {"slug": slug, "suffix": ""},
         "content": {
             "title": title,
             "description": description,
-            "status": "todo",
+            "status": status,
             "label_ids": [],
             "checklists": [],
         },
@@ -2052,17 +2059,19 @@ def _import_template_metadata(source: ImportSource, title: str, description: str
     }
 
 
-def import_txt_tasks(config: Config) -> ImportResult:
-    """Prepare immediate PLAN/*.txt files as templates for one later sync."""
+def import_txt_tasks(plan_dir: Path, *, todo_only: bool = False) -> ImportResult:
+    """Prepare immediate PLAN/*.txt files as local card documents."""
 
-    plan_dir = config.plan_dir
+    plan_dir = Path(plan_dir).absolute()
+    project_root = plan_dir.parent.resolve()
     result = ImportResult()
-    if plan_dir.exists() and not _path_is_within(plan_dir, config.project_root):
+    if plan_dir.exists() and not _path_is_within(plan_dir, project_root):
         raise SyncAssistError("PLAN path escapes the project root")
     if plan_dir.is_symlink():
         raise SyncAssistError("refusing symlinked PLAN directory")
+    if not plan_dir.exists():
+        return result
     try:
-        plan_dir.mkdir(parents=True, exist_ok=True)
         plan_entries = list(plan_dir.iterdir())
     except OSError as exc:
         raise SyncAssistError(f"could not access PLAN ({type(exc).__name__})") from exc
@@ -2072,6 +2081,7 @@ def import_txt_tasks(config: Config) -> ImportResult:
             path
             for path in plan_entries
             if path.suffix.casefold() == ".txt"
+            and (not todo_only or path.name.casefold().startswith("todo-"))
         ),
         key=lambda path: path.name.casefold(),
     )
@@ -2092,13 +2102,17 @@ def import_txt_tasks(config: Config) -> ImportResult:
             result.errors.append(f"{path.name}: could not read ({type(exc).__name__})")
             continue
 
-        title = _import_title(text)
-        if not title:
+        if not text.strip():
             result.skipped += 1
             result.errors.append(f"{path.name}: empty or whitespace-only content")
             continue
 
         source = ImportSource(path, relative_path, _import_digest(text))
+        title = _import_title(source)
+        if not title:
+            result.skipped += 1
+            result.errors.append(f"{path.name}: filename has no usable task title")
+            continue
         existing = _find_import_document(plan_dir, source)
         if existing is not None:
             result.sources.append(source)
@@ -2119,82 +2133,65 @@ def import_txt_tasks(config: Config) -> ImportResult:
     return result
 
 
-def _allocate_imported_path(imported_dir: Path, source: ImportSource) -> Path:
-    original = imported_dir / source.path.name
+def _allocate_converted_path(converted_dir: Path, source: ImportSource) -> Path:
+    original = converted_dir / source.path.name
     if not original.exists() and not original.is_symlink():
         return original
     stem = source.path.stem
     extension = source.path.suffix
     for length in (8, 12, 16, 24):
-        candidate = imported_dir / f"{stem}--{source.digest[:length]}{extension}"
+        candidate = converted_dir / f"{stem}--{source.digest[:length]}{extension}"
         if not candidate.exists() and not candidate.is_symlink():
             return candidate
     counter = 2
     while True:
-        candidate = imported_dir / f"{stem}--{source.digest[:8]}-{counter}{extension}"
+        candidate = converted_dir / f"{stem}--{source.digest[:8]}-{counter}{extension}"
         if not candidate.exists() and not candidate.is_symlink():
             return candidate
         counter += 1
 
 
-def _find_import_card(config: Config, source: ImportSource) -> ParsedDocument | None:
-    for path in sorted(config.plan_dir.glob("*.md"), key=lambda item: item.name.casefold()):
-        if path.name.casefold() == TEMPLATE_FILENAME.casefold() or path.is_symlink() or not path.is_file():
-            continue
-        try:
-            parsed = parse_document(path, path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError, TypeError):
-            continue
-        metadata = parsed.metadata
-        if (
-            metadata.get("role") == "card"
-            and _import_source_matches(metadata, source)
-            and ID_PATTERN.fullmatch(str(metadata.get("trello_card_id", "")))
-            and str(metadata.get("trello_list_id", "")) == config.list_id
-        ):
-            return parsed
-    return None
+def finalize_imports(plan_dir: Path, result: ImportResult) -> None:
+    """Move sources with a saved Markdown card to PLAN/.converted/."""
 
-
-def finalize_imports(config: Config, result: ImportResult) -> None:
-    """Move only confirmed imported sources to PLAN/.imported/."""
-
+    plan_dir = Path(plan_dir).absolute()
     for source in result.sources:
         if not source.path.exists():
             continue
         try:
+            _assert_safe_plan_file(source.path, plan_dir)
             current_text = _normalise_import_text(source.path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError) as exc:
+        except (OSError, UnicodeError, SyncAssistError) as exc:
             result.failed += 1
             result.errors.append(f"{source.path.name}: could not verify source ({type(exc).__name__})")
             continue
         if _import_digest(current_text) != source.digest:
             result.failed += 1
-            result.errors.append(f"{source.path.name}: source changed during synchronization")
+            result.errors.append(f"{source.path.name}: source changed during import")
             continue
-        if _find_import_card(config, source) is None:
+        if _find_import_document(plan_dir, source) is None:
             result.failed += 1
-            result.errors.append(f"{source.path.name}: card was not confirmed after synchronization")
+            result.errors.append(f"{source.path.name}: local card was not created")
             continue
 
-        imported_dir = config.plan_dir / ".imported"
-        if imported_dir.is_symlink() or (imported_dir.exists() and not imported_dir.is_dir()):
+        converted_dir = plan_dir / ".converted"
+        if converted_dir.is_symlink() or (converted_dir.exists() and not converted_dir.is_dir()):
             result.failed += 1
-            result.errors.append(f"{source.path.name}: PLAN/.imported is not a regular directory")
+            result.errors.append(f"{source.path.name}: PLAN/.converted is not a regular directory")
             continue
-        created_dir = not imported_dir.exists()
+        created_dir = not converted_dir.exists()
         try:
-            imported_dir.mkdir(parents=True, exist_ok=True)
-            target = _allocate_imported_path(imported_dir, source)
-            _assert_safe_plan_file(target, config.plan_dir)
+            converted_dir.mkdir(parents=True, exist_ok=True)
+            target = _allocate_converted_path(converted_dir, source)
+            _assert_safe_plan_file(target, plan_dir)
             shutil.move(str(source.path), str(target))
-            result.imported += 1
+            result.converted += 1
         except (OSError, SyncAssistError) as exc:
             result.failed += 1
-            result.errors.append(f"{source.path.name}: could not move to .imported ({type(exc).__name__})")
+            result.errors.append(f"{source.path.name}: could not move to .converted ({type(exc).__name__})")
             if created_dir:
                 try:
-                    imported_dir.rmdir()
+                    converted_dir.rmdir()
                 except OSError:
                     pass
 
@@ -2202,7 +2199,7 @@ def finalize_imports(config: Config, result: ImportResult) -> None:
 def _print_import_report(result: ImportResult, *, output: Any = sys.stdout, errors: Any = sys.stderr) -> None:
     print(
         "Import summary: "
-        f"prepared={result.prepared} imported={result.imported} "
+        f"prepared={result.prepared} converted={result.converted} "
         f"skipped={result.skipped} failed={result.failed}",
         file=output,
     )
@@ -4744,8 +4741,8 @@ def _exit_code(report: Mapping[str, Any]) -> int:
 CLI_HELP_EPILOG = """\
 Operations:
   python sync.py
-      Check required .env values, then run one synchronization. If any are
-      missing, setup runs only after confirmation.
+      Convert PLAN/todo-*.txt locally, check required .env values, then run
+      one synchronization. If any are missing, setup runs only after confirmation.
 
   python sync.py --setup
       Interactively create or resume .env. Existing values continue by
@@ -4755,15 +4752,15 @@ Operations:
       restart setup. Other .env entries are preserved.
 
   python sync.py --import
-      Convert only PLAN/*.txt files directly inside PLAN/ into new todo cards,
-      move confirmed sources to PLAN/.imported/, then run one normal sync.
+      Convert PLAN/*.txt files directly inside PLAN/ into local Markdown cards
+      and move their sources to PLAN/.converted/, then synchronize normally.
 
   python sync.py --version
       Print the SyncAssist version.
 
 Arguments:
   --setup              Create or resume .env through the setup wizard.
-  --import             Import immediate PLAN/*.txt files, then synchronize.
+  --import             Convert immediate PLAN/*.txt files, then synchronize.
   --version            Print the version and exit.
   -h, --help           Print this reference and exit.
   No positional arguments are accepted. --setup and --import cannot be combined.
@@ -4780,7 +4777,8 @@ Recommended workflow:
   3. Copy PLAN/_modelo-card.md to PLAN/todo-<slug>.md or PLAN/done-<slug>.md.
   4. Edit the title, Description, checklists or valid content.label_ids.
   5. Run `python sync.py` and inspect its final summary.
-  6. Use `--import` only for new .txt files directly in PLAN/.
+  6. Drop `todo-<name>.txt` in PLAN/ for automatic conversion before sync, or
+     use `--import` to convert all immediate TXT files and synchronize.
 
 Project files:
   .env                    Required credentials, board URL and list configuration (private).
@@ -4789,7 +4787,7 @@ Project files:
   PLAN/done-*.md          Completed card documents.
   PLAN/.conflicts/         Local/remote conflict artifacts for manual review.
   PLAN/.removed/           Removed and archived cards, kept for recovery.
-  PLAN/.imported/          Confirmed TXT sources imported as cards.
+  PLAN/.converted/         TXT sources moved after a local card is saved.
 
 Editable versus reference data:
   Editable: first # heading, Description, checklist headings/items,
@@ -4827,7 +4825,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--import",
         dest="import_tasks",
         action="store_true",
-        help="convert immediate PLAN/*.txt files into Trello todo cards, then sync",
+        help="convert immediate PLAN/*.txt files into cards, then synchronize",
     )
     return parser
 
@@ -4855,14 +4853,23 @@ def main(argv: list[str] | None = None) -> int:
     project_root = Path(__file__).resolve().parent
     env_path = project_root / ".env"
     try:
+        if args.import_tasks:
+            _print_progress("SyncAssist: Preparing TXT files for import...")
+        else:
+            _print_progress("SyncAssist: Checking for todo-*.txt tasks...")
+        import_result = import_txt_tasks(project_root / "PLAN", todo_only=not args.import_tasks)
+        finalize_imports(project_root / "PLAN", import_result)
+        if import_result.prepared or import_result.converted or import_result.errors:
+            _print_import_report(import_result)
+
         should_run_setup = args.setup
         if not should_run_setup:
             missing = _missing_env_keys(env_path)
             if missing:
                 print("Missing required environment variables: " + ", ".join(missing))
                 if not _confirm_yes_no("Would you like to run setup now? [y/N]: "):
-                    print("Synchronization cancelled. No changes were made.")
-                    return 0
+                    print("Synchronization cancelled; local TXT conversions, if any, were preserved.")
+                    return 1 if import_result.errors or import_result.failed else 0
                 should_run_setup = True
 
         if should_run_setup:
@@ -4878,21 +4885,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
             if not _confirm_yes_no("Setup completed. Start synchronization now? [y/N]: "):
-                print("Synchronization skipped.")
-                return 0
+                print("Synchronization skipped; local TXT conversions, if any, were preserved.")
+                return 1 if import_result.errors or import_result.failed else 0
 
         _print_progress("SyncAssist: Loading configuration...")
         config = Config.from_file(env_path, project_root)
-        if args.import_tasks:
-            _print_progress("SyncAssist: Preparing TXT files for import...")
-        import_result = import_txt_tasks(config) if args.import_tasks else None
         report = sync_once(config, progress=_print_progress)
-        if import_result is not None:
-            _print_progress("SyncAssist: Finalizing confirmed imports...")
-            finalize_imports(config, import_result)
-            _print_import_report(import_result)
         _print_report(report)
-        if import_result is not None and (import_result.errors or import_result.failed):
+        if import_result.errors or import_result.failed:
             return 1
         return _exit_code(report)
     except (KeyboardInterrupt, EOFError):

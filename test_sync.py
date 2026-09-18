@@ -967,6 +967,8 @@ class SetupTests(unittest.TestCase):
             "python sync.py --setup",
             "python sync.py --import",
             "python sync.py --version",
+            "then synchronize normally",
+            "PLAN/.converted/",
             "Existing values continue by",
             "After setup, confirm whether to start synchronization",
             "TRELLO_BOARD_URL",
@@ -978,7 +980,7 @@ class SetupTests(unittest.TestCase):
             self.assertIn(expected, help_text)
 
     def test_product_version_matches_release(self):
-        self.assertEqual(SCRIPT_VERSION, "1.2.5")
+        self.assertEqual(SCRIPT_VERSION, "1.3.0")
 
     def complete_env(self):
         return {
@@ -1088,43 +1090,50 @@ class SetupTests(unittest.TestCase):
         load_config.assert_not_called()
         sync_call.assert_not_called()
 
-    def test_main_imports_before_running_one_normal_sync(self):
+    def test_main_import_converts_all_txt_before_sync(self):
         config = object()
-        import_result = mock.Mock(errors=[], failed=0)
         report = {"failures": 0, "conflicts": 0}
+        import_result = mock.Mock(prepared=2, converted=2, errors=[], failed=0)
+        events = []
         with (
+            mock.patch("sync.import_txt_tasks", side_effect=lambda *a, **k: events.append("convert") or import_result) as import_tasks,
+            mock.patch("sync.finalize_imports", side_effect=lambda *_: events.append("move")) as finalize,
             mock.patch("sync._missing_env_keys", return_value=[]),
-            mock.patch("sync.Config.from_file", return_value=config),
-            mock.patch("sync.import_txt_tasks", return_value=import_result) as import_tasks,
-            mock.patch("sync.sync_once", return_value=report) as sync_call,
-            mock.patch("sync.finalize_imports") as finalize,
+            mock.patch("sync.Config.from_file", side_effect=lambda *_: events.append("config") or config),
+            mock.patch("sync.sync_once", side_effect=lambda *_a, **_k: events.append("sync") or report) as sync_call,
             mock.patch("sync._print_import_report") as print_import,
             mock.patch("sync._print_report") as print_report,
         ):
             self.assertEqual(main(["--import"]), 0)
 
-        import_tasks.assert_called_once_with(config)
-        sync_call.assert_called_once()
+        self.assertEqual(import_tasks.call_args.args[0].name, "PLAN")
+        import_tasks.assert_called_once_with(import_tasks.call_args.args[0], todo_only=False)
+        finalize.assert_called_once_with(import_tasks.call_args.args[0], import_result)
+        self.assertEqual(events, ["convert", "move", "config", "sync"])
         self.assertIs(sync_call.call_args.args[0], config)
-        self.assertIsNotNone(sync_call.call_args.kwargs["progress"])
-        finalize.assert_called_once_with(config, import_result)
         print_import.assert_called_once_with(import_result)
         print_report.assert_called_once_with(report)
 
-    def test_main_without_flags_keeps_the_normal_sync_path(self):
+    def test_main_converts_and_moves_todo_txt_before_normal_sync(self):
         config = object()
         report = {"failures": 0, "conflicts": 0}
+        import_result = mock.Mock(prepared=0, converted=0, errors=[], failed=0)
+        events = []
         with (
             mock.patch("sync._missing_env_keys", return_value=[]),
             mock.patch("sync.run_setup") as setup,
-            mock.patch("sync.Config.from_file", return_value=config),
-            mock.patch("sync.import_txt_tasks") as import_tasks,
-            mock.patch("sync.sync_once", return_value=report) as sync_call,
+            mock.patch("sync.Config.from_file", side_effect=lambda *_: events.append("config") or config),
+            mock.patch("sync.import_txt_tasks", side_effect=lambda *a, **k: events.append("convert") or import_result) as import_tasks,
+            mock.patch("sync.finalize_imports", side_effect=lambda *_: events.append("move")) as finalize,
+            mock.patch("sync.sync_once", side_effect=lambda *_a, **_k: events.append("sync") or report) as sync_call,
             mock.patch("sync._print_report") as print_report,
         ):
             self.assertEqual(main([]), 0)
 
-        import_tasks.assert_not_called()
+        import_tasks.assert_called_once_with(import_tasks.call_args.args[0], todo_only=True)
+        self.assertEqual(import_tasks.call_args.args[0].name, "PLAN")
+        finalize.assert_called_once_with(import_tasks.call_args.args[0], import_result)
+        self.assertEqual(events, ["convert", "move", "config", "sync"])
         setup.assert_not_called()
         sync_call.assert_called_once()
         self.assertIs(sync_call.call_args.args[0], config)
@@ -1855,25 +1864,57 @@ class ImportTests(unittest.TestCase):
             root,
         )
 
-    def test_import_uses_normalized_60_character_title_and_full_description(self):
+    def test_import_uses_filename_as_title_and_preserves_full_description(self):
         root = Path(tempfile.mkdtemp())
         plan_dir = root / "PLAN"
         plan_dir.mkdir()
         source_text = "  First   line\r\nsecond line with more than sixty characters " + "x" * 50
         (plan_dir / "source-task.txt").write_bytes(source_text.encode("utf-8"))
 
-        result = import_txt_tasks(self.make_config(root))
+        result = import_txt_tasks(plan_dir)
 
         self.assertEqual(result.prepared, 1)
         path = plan_dir / "todo-source-task.md"
         self.assertTrue(path.exists())
         parsed = parse_document(path, path.read_text(encoding="utf-8"))
-        expected_title = "First line second line with more than sixty characters " + "x" * 50
-        self.assertEqual(parsed.projection["title"], expected_title[:60])
+        self.assertEqual(parsed.projection["title"], "source task")
         self.assertEqual(parsed.projection["description"], source_text.replace("\r\n", "\n"))
-        self.assertLessEqual(len(parsed.projection["title"]), 60)
         self.assertEqual(parsed.metadata["role"], "template")
         self.assertEqual(parsed.metadata["import_source"]["relative_path"], "source-task.txt")
+
+    def test_todo_filename_becomes_matching_card_before_source_moves(self):
+        root = Path(tempfile.mkdtemp())
+        plan_dir = root / "PLAN"
+        plan_dir.mkdir()
+        source = plan_dir / "todo-tarefa.txt"
+        source.write_text("Descricao simples da tarefa.", encoding="utf-8")
+
+        result = import_txt_tasks(plan_dir, todo_only=True)
+        finalize_imports(plan_dir, result)
+
+        card_path = plan_dir / "todo-tarefa.md"
+        parsed = parse_document(card_path, card_path.read_text(encoding="utf-8"))
+        self.assertEqual(parsed.projection["title"], "tarefa")
+        self.assertEqual(parsed.projection["description"], "Descricao simples da tarefa.")
+        self.assertEqual(parsed.metadata["role"], "template")
+        self.assertEqual(result.converted, 1)
+        self.assertFalse(source.exists())
+        self.assertTrue((plan_dir / ".converted" / source.name).exists())
+
+    def test_automatic_import_only_picks_todo_prefixed_files(self):
+        root = Path(tempfile.mkdtemp())
+        plan_dir = root / "PLAN"
+        plan_dir.mkdir()
+        (plan_dir / "todo-first.txt").write_text("First", encoding="utf-8")
+        untouched = plan_dir / "notes.txt"
+        untouched.write_text("Not an automatic task", encoding="utf-8")
+
+        result = import_txt_tasks(plan_dir, todo_only=True)
+        finalize_imports(plan_dir, result)
+
+        self.assertTrue((plan_dir / "todo-first.md").exists())
+        self.assertTrue(untouched.exists())
+        self.assertEqual(result.converted, 1)
 
     def test_import_skips_empty_invalid_and_nested_sources(self):
         root = Path(tempfile.mkdtemp())
@@ -1883,7 +1924,7 @@ class ImportTests(unittest.TestCase):
         (plan_dir / "invalid.txt").write_bytes(b"\xff\xfe")
         (plan_dir / "nested" / "nested.txt").write_text("Nested", encoding="utf-8")
 
-        result = import_txt_tasks(self.make_config(root))
+        result = import_txt_tasks(plan_dir)
 
         self.assertEqual(result.prepared, 0)
         self.assertEqual(result.skipped, 2)
@@ -1900,8 +1941,8 @@ class ImportTests(unittest.TestCase):
         source.write_text("Imported task", encoding="utf-8")
         (plan_dir / "todo-same.md").write_text("human file", encoding="utf-8")
 
-        first = import_txt_tasks(self.make_config(root))
-        second = import_txt_tasks(self.make_config(root))
+        first = import_txt_tasks(plan_dir)
+        second = import_txt_tasks(plan_dir)
 
         self.assertEqual(first.prepared, 1)
         self.assertEqual(second.prepared, 0)
@@ -1910,7 +1951,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(len(imported_files), 2)
         self.assertTrue(any("-import-" in path.name for path in imported_files))
 
-    def test_import_syncs_cards_and_moves_only_confirmed_sources(self):
+    def test_import_converts_sources_before_the_normal_sync(self):
         root = Path(tempfile.mkdtemp())
         plan_dir = root / "PLAN"
         plan_dir.mkdir()
@@ -1919,34 +1960,34 @@ class ImportTests(unittest.TestCase):
         config = self.make_config(root)
         api = ImportApi()
 
-        result = import_txt_tasks(config)
+        result = import_txt_tasks(plan_dir)
+        finalize_imports(plan_dir, result)
         report = sync_once(config, api, now="2026-09-14T00:00:00Z")
-        finalize_imports(config, result)
 
         self.assertEqual(report["created"], 2)
         self.assertEqual(len(api.created), 2)
-        self.assertEqual(result.imported, 2)
-        self.assertEqual(sorted(path.name for path in (plan_dir / ".imported").glob("*.txt")), ["alpha.txt", "beta.txt"])
+        self.assertEqual(result.converted, 2)
+        self.assertEqual(sorted(path.name for path in (plan_dir / ".converted").glob("*.txt")), ["alpha.txt", "beta.txt"])
         self.assertFalse((plan_dir / "alpha.txt").exists())
         self.assertFalse((plan_dir / "beta.txt").exists())
         card_files = plan_card_files(root)
         self.assertEqual(len(card_files), 2)
         self.assertTrue(all(parse_document(path, path.read_text(encoding="utf-8")).metadata["role"] == "card" for path in card_files))
 
-    def test_import_leaves_source_when_card_is_not_confirmed(self):
+    def test_import_moves_source_after_local_card_creation_without_trello_confirmation(self):
         root = Path(tempfile.mkdtemp())
         plan_dir = root / "PLAN"
         plan_dir.mkdir()
         source = plan_dir / "task.txt"
         source.write_text("Task", encoding="utf-8")
-        result = import_txt_tasks(self.make_config(root))
+        result = import_txt_tasks(plan_dir)
 
-        finalize_imports(self.make_config(root), result)
+        finalize_imports(plan_dir, result)
 
-        self.assertTrue(source.exists())
-        self.assertEqual(result.imported, 0)
-        self.assertEqual(result.failed, 1)
-        self.assertFalse((plan_dir / ".imported").exists())
+        self.assertFalse(source.exists())
+        self.assertEqual(result.converted, 1)
+        self.assertEqual(result.failed, 0)
+        self.assertTrue((plan_dir / ".converted" / "task.txt").exists())
 
     def test_import_does_not_move_source_changed_after_preparation(self):
         root = Path(tempfile.mkdtemp())
@@ -1954,13 +1995,13 @@ class ImportTests(unittest.TestCase):
         plan_dir.mkdir()
         source = plan_dir / "task.txt"
         source.write_text("Task", encoding="utf-8")
-        result = import_txt_tasks(self.make_config(root))
+        result = import_txt_tasks(plan_dir)
         source.write_text("Changed task", encoding="utf-8")
 
-        finalize_imports(self.make_config(root), result)
+        finalize_imports(plan_dir, result)
 
         self.assertTrue(source.exists())
-        self.assertEqual(result.imported, 0)
+        self.assertEqual(result.converted, 0)
         self.assertEqual(result.failed, 1)
 
 

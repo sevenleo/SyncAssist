@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0] - 2026-09-18
+
+### Added
+
+- Converted plain `todo-*.txt` files into minimum-field Markdown cards before normal synchronization, then moved their sources to `PLAN/.converted/`.
+- Updated `--import` to use the same pre-sync conversion and `.converted` handling.
+
 ## [1.2.5] - 2026-09-18
 
 ### Fixed
