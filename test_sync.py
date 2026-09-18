@@ -978,7 +978,7 @@ class SetupTests(unittest.TestCase):
             self.assertIn(expected, help_text)
 
     def test_product_version_matches_release(self):
-        self.assertEqual(SCRIPT_VERSION, "1.2.4")
+        self.assertEqual(SCRIPT_VERSION, "1.2.5")
 
     def complete_env(self):
         return {
@@ -1738,6 +1738,59 @@ class FakeApi:
         ]
 
 
+class PositionAwareFakeApi(FakeApi):
+    def __init__(self, bundle, *, legacy_zero_position=False):
+        super().__init__(bundle)
+        self.legacy_zero_position = legacy_zero_position
+        self.fail_next_position_update = False
+
+    def _position(self, values, pos):
+        if pos == "top":
+            return min((float(value.get("pos", 0)) for value in values), default=0) - 16384
+        if pos == "bottom" or pos is None:
+            if self.legacy_zero_position:
+                return 16384 if not values else len(values)
+            return max((float(value.get("pos", 0)) for value in values), default=0) + 16384
+        value = float(pos)
+        return 16384 if value == 0 else value
+
+    def create_checklist(self, card_id, name, pos=None):
+        checklist = super().create_checklist(card_id, name, pos)
+        checklist["pos"] = self._position(self.bundle["checklists"][:-1], pos)
+        return checklist
+
+    def update_checklist(self, checklist_id, fields):
+        if fields.get("pos") == "top" and self.fail_next_position_update:
+            self.fail_next_position_update = False
+            raise RemoteError("simulated interruption during checklist order repair")
+        checklist = super().update_checklist(checklist_id, fields)
+        if fields.get("pos") == "top":
+            checklist["pos"] = self._position(
+                [item for item in self.bundle["checklists"] if item["id"] != checklist_id], "top"
+            )
+        return checklist
+
+    def create_checkitem(self, checklist_id, name, pos=None):
+        checklist = next(item for item in self.bundle["checklists"] if item["id"] == checklist_id)
+        item_id = f"{sum(len(value.get('checkItems', [])) for value in self.bundle['checklists']) + 1:024x}"
+        item = {"id": item_id, "name": name, "state": "incomplete"}
+        checklist.setdefault("checkItems", []).append(item)
+        item["pos"] = self._position(checklist["checkItems"][:-1], pos)
+        return item
+
+    def update_checkitem(self, card_id, item_id, fields):
+        item = super().update_checkitem(card_id, item_id, fields)
+        if fields.get("pos") == "top":
+            checklist = next(
+                checklist for checklist in self.bundle["checklists"]
+                if any(value["id"] == item_id for value in checklist["checkItems"])
+            )
+            item["pos"] = self._position(
+                [value for value in checklist["checkItems"] if value["id"] != item_id], "top"
+            )
+        return item
+
+
 class ImportApi:
     list_id = "abcdef1234567890abcdef34"
     board_id = "abcdef1234567890abcdef90"
@@ -2060,6 +2113,10 @@ class SyncOnceTests(unittest.TestCase):
         template = root / "PLAN" / TEMPLATE_FILENAME
         self.assertTrue(template.exists())
         template_text = template.read_text(encoding="utf-8")
+        self.assertIn("163 characters", template_text)
+        self.assertIn("syncassist:checklist=new:key", template_text)
+        self.assertIn("syncassist:item=new:key", template_text)
+        self.assertIn('"template_version": 2', template_text)
         new_path = root / "PLAN" / "todo-people.md"
         new_path.write_text(
             template_text.replace("# New task", "# People", 1).replace(
@@ -2078,6 +2135,208 @@ class SyncOnceTests(unittest.TestCase):
         parsed = parse_document(new_path, new_path.read_text(encoding="utf-8"))
         self.assertEqual(parsed.metadata["role"], "card")
         self.assertEqual(parsed.metadata["trello_card_id"], api.bundle["card"]["id"])
+
+    def test_existing_generated_template_upgrades_only_its_instruction_block(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        template = root / "PLAN" / TEMPLATE_FILENAME
+        original = template.read_text(encoding="utf-8")
+        start_marker = "<!-- syncassist:template-instructions:begin -->"
+        end_marker = "<!-- syncassist:template-instructions:end -->"
+        start = original.index(start_marker)
+        end = original.index(end_marker, start) + len(end_marker)
+        legacy = (
+            "> Copy this file to `todo-task-name.md` or `done-task-name.md`, edit the title and description, then run sync.\n"
+            "> This template file is never sent to Trello."
+        )
+        template.write_text(
+            original[:start] + legacy + original[end:] + "\n<!-- my custom note -->\n",
+            encoding="utf-8",
+        )
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        updated = template.read_text(encoding="utf-8")
+        self.assertEqual(report["failures"], 0)
+        self.assertIn(start_marker, updated)
+        self.assertIn("163 characters", updated)
+        self.assertIn("my custom note", updated)
+        self.assertNotIn(legacy, updated)
+
+    def test_old_template_without_instructions_gets_current_block_and_keeps_custom_text(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+        template = root / "PLAN" / TEMPLATE_FILENAME
+        metadata = parse_document(template, template.read_text(encoding="utf-8")).metadata
+        metadata["sync"].pop("template_version", None)
+        old_template = render_document(metadata) + "\n<!-- custom template note -->\n"
+        template.write_text(old_template, encoding="utf-8")
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        updated = template.read_text(encoding="utf-8")
+        refreshed_metadata = parse_document(template, updated).metadata
+        self.assertEqual(report["failures"], 0)
+        self.assertIn("syncassist:template-instructions:begin", updated)
+        self.assertIn("163 characters", updated)
+        self.assertIn("custom template note", updated)
+        self.assertEqual(refreshed_metadata["sync"]["template_version"], 2)
+
+    def test_new_template_card_preserves_checklist_order_and_completed_items(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = PositionAwareFakeApi(sample_bundle(), legacy_zero_position=True)
+        api.cards = []
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+
+        template = (root / "PLAN" / TEMPLATE_FILENAME).read_text(encoding="utf-8")
+        checklist_content = (
+            "## Checklists\n"
+            "### Diagnose <!-- syncassist:checklist=new:diagnose -->\n"
+            "- [ ] Gather logs <!-- syncassist:item=new:gather-logs -->\n"
+            "- [x] Confirm failure <!-- syncassist:item=new:confirm-failure -->\n\n"
+            "### Fix <!-- syncassist:checklist=new:fix -->\n"
+            "- [ ] Install the DLL <!-- syncassist:item=new:install-dll -->\n"
+        )
+        new_card = template.replace("# New task", "# Repair installation", 1).replace(
+            "## Checklists\n", checklist_content, 1
+        ).replace(
+            "## Description\n", "## Description\nInstallation investigation notes.\n", 1
+        )
+        new_path = root / "PLAN" / "todo-repair-installation.md"
+        new_path.write_text(new_card, encoding="utf-8")
+
+        report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertEqual(report["created"], 1)
+        self.assertEqual(report["failures"], 0, report["errors"])
+        parsed = parse_document(new_path, new_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [checklist["name"] for checklist in parsed.projection["checklists"]],
+            ["Diagnose", "Fix"],
+        )
+        self.assertEqual(
+            [item["name"] for item in parsed.projection["checklists"][0]["items"]],
+            ["Gather logs", "Confirm failure"],
+        )
+        self.assertEqual(parsed.projection["checklists"][0]["items"][1]["state"], "complete")
+        self.assertEqual(api.bundle["card"]["desc"], "Installation investigation notes.\n")
+        all_ids = [checklist["id"] for checklist in parsed.projection["checklists"]]
+        all_ids.extend(
+            item["id"] for checklist in parsed.projection["checklists"] for item in checklist["items"]
+        )
+        self.assertTrue(all(not value.startswith("new:") for value in all_ids))
+        self.assertIsNone(parsed.metadata["sync"].get("pending"))
+
+    def test_pending_card_with_confirmed_creates_recovers_order_without_recreating_ids(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = PositionAwareFakeApi(sample_bundle(), legacy_zero_position=True)
+        api.cards = []
+        sync_once(config, api, now="2026-09-14T00:00:00Z")
+
+        template = (root / "PLAN" / TEMPLATE_FILENAME).read_text(encoding="utf-8")
+        checklist_content = (
+            "## Checklists\n"
+            "### Diagnose <!-- syncassist:checklist=new:diagnose -->\n"
+            "- [ ] Gather logs <!-- syncassist:item=new:gather-logs -->\n"
+            "- [x] Confirm failure <!-- syncassist:item=new:confirm-failure -->\n\n"
+            "### Fix <!-- syncassist:checklist=new:fix -->\n"
+            "- [ ] Install the DLL <!-- syncassist:item=new:install-dll -->\n"
+        )
+        new_path = root / "PLAN" / "todo-repair-installation.md"
+        new_path.write_text(
+            template.replace("# New task", "# Repair installation", 1).replace(
+                "## Checklists\n", checklist_content, 1
+            ).replace(
+                "## Description\n", "## Description\nInstallation investigation notes.\n", 1
+            ),
+            encoding="utf-8",
+        )
+
+        api.fail_next_position_update = True
+        first = sync_once(config, api, now="2026-09-14T00:01:00Z")
+        self.assertEqual(first["failures"], 1)
+        self.assertEqual(len(api.cards), 1)
+        card_id = api.bundle["card"]["id"]
+        checklist_ids = [checklist["id"] for checklist in api.bundle["checklists"]]
+        item_ids = [
+            item["id"]
+            for checklist in api.bundle["checklists"]
+            for item in checklist["checkItems"]
+        ]
+        self.assertIsNotNone(
+            parse_document(new_path, new_path.read_text(encoding="utf-8"))
+            .metadata["sync"].get("pending")
+        )
+        parsed = parse_document(new_path, new_path.read_text(encoding="utf-8"))
+        metadata = parsed.metadata
+        metadata["sync"]["conflict"] = {
+            "conflict_id": "legacy123456",
+            "reason": "pending_remote_operation_requires_confirmation",
+            "created_at": "2026-09-14T00:02:00Z",
+            "expected_remote_hash": canonical_hash(build_remote_projection(api.bundle)),
+        }
+        metadata["sync"]["resolution"] = None
+        new_path.write_text(render_document(metadata), encoding="utf-8")
+        conflict_artifact = root / "PLAN" / ".conflicts" / f"{card_id}-legacy123456.md"
+        conflict_artifact.parent.mkdir(parents=True, exist_ok=True)
+        conflict_artifact.write_text("# Previous pending-operation conflict\n", encoding="utf-8")
+
+        api.legacy_zero_position = False
+        recovered = sync_once(config, api, now="2026-09-14T00:02:00Z")
+
+        self.assertEqual(recovered["conflicts"], 0)
+        self.assertEqual(recovered["failures"], 0, recovered["errors"])
+        self.assertEqual(recovered["updated"], 1)
+        self.assertEqual(len(api.cards), 1)
+        self.assertEqual(api.bundle["card"]["id"], card_id)
+        self.assertEqual(api.bundle["card"]["desc"], "Installation investigation notes.\n")
+        self.assertEqual([checklist["id"] for checklist in api.bundle["checklists"]], checklist_ids)
+        self.assertEqual(
+            [item["id"] for checklist in api.bundle["checklists"] for item in checklist["checkItems"]],
+            item_ids,
+        )
+        parsed = parse_document(new_path, new_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [checklist["name"] for checklist in parsed.projection["checklists"]],
+            ["Diagnose", "Fix"],
+        )
+        self.assertEqual(
+            [item["name"] for item in parsed.projection["checklists"][0]["items"]],
+            ["Gather logs", "Confirm failure"],
+        )
+        self.assertEqual(parsed.projection["checklists"][0]["items"][1]["state"], "complete")
+        self.assertIsNone(parsed.metadata["sync"].get("pending"))
+        self.assertIsNone(parsed.metadata["sync"].get("conflict"))
+        self.assertIn("syncassist:conflict-resolved choice=local", conflict_artifact.read_text(encoding="utf-8"))
+
+    def test_new_template_copy_blocks_oversized_fields_before_trello_post(self):
+        for title, description in (("T" * 164, ""), ("Valid title", "D" * 16385)):
+            with self.subTest(title_length=len(title), description_length=len(description)):
+                root = Path(tempfile.mkdtemp())
+                config = self.make_config(root)
+                api = FakeApi(sample_bundle())
+                api.cards = []
+                sync_once(config, api, now="2026-09-14T00:00:00Z")
+
+                template = (root / "PLAN" / TEMPLATE_FILENAME).read_text(encoding="utf-8")
+                new_card = template.replace("# New task", f"# {title}", 1).replace(
+                    "## Description\n", f"## Description\n{description}\n", 1
+                )
+                (root / "PLAN" / "todo-validation.md").write_text(new_card, encoding="utf-8")
+
+                report = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+                self.assertTrue(
+                    any("exceeds Trello's card" in error["message"] for error in report["errors"])
+                )
+                self.assertEqual(report["created"], 0)
+                self.assertEqual(api.cards, [])
 
     def test_sync_rewrites_legacy_metadata_first_document(self):
         root = Path(tempfile.mkdtemp())

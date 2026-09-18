@@ -79,8 +79,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 
-SCRIPT_VERSION = "1.2.4"
+SCRIPT_VERSION = "1.2.5"
 SCHEMA_VERSION = 1
+TEMPLATE_INSTRUCTIONS_VERSION = 2
 API_BASE = "https://api.trello.com/1"
 METADATA_BEGIN = "<!-- syncassist:metadata"
 METADATA_END = "syncassist:end -->"
@@ -1415,21 +1416,100 @@ def _render_new_card_template() -> str:
         },
         "reference": {},
         "sync": {
+            "template_version": TEMPLATE_INSTRUCTIONS_VERSION,
             "reference_hash": canonical_hash({}),
             "read_only_hash": _read_only_hash({}),
         },
     }
     document = render_document(metadata)
-    instructions = (
-        "> Copy this file to `todo-task-name.md` or `done-task-name.md`, edit the "
-        "title and description, then run sync.\n"
-        "> This template file is never sent to Trello.\n\n"
-    )
+    instructions = _template_instructions_block()
     description_end = _section_marker(metadata["section_token"], "description", "end")
     return document.replace(
         description_end + "\n\n",
-        description_end + "\n\n" + instructions,
+        description_end + "\n\n" + instructions + "\n\n",
         1,
+    )
+
+
+def _template_instructions_block() -> str:
+    return "\n".join(
+        (
+            "<!-- syncassist:template-instructions:begin -->",
+            "> Copy this file to `todo-task-name.md` or `done-task-name.md`, edit the title and description, then run sync.",
+            "> Keep the title between 1 and 163 characters and the description at 16,384 characters or fewer.",
+            "> Checklist: `### Name <!-- syncassist:checklist=new:key -->`; item: `- [ ] Name <!-- syncassist:item=new:key -->` (`[x]` means complete).",
+            "> Give every new checklist and item a unique lowercase key using letters, digits, or hyphens; preserve existing IDs and use only board label IDs in `content.label_ids`.",
+            "> This template file is never sent to Trello.",
+            "<!-- syncassist:template-instructions:end -->",
+        )
+    )
+
+
+def _upgrade_template_instructions(text: str) -> str:
+    if text.count(METADATA_BEGIN) != 1 or text.count(METADATA_END) != 1:
+        return text
+    metadata_start = text.index(METADATA_BEGIN)
+    metadata_end = text.index(METADATA_END, metadata_start + len(METADATA_BEGIN))
+    try:
+        metadata = json.loads(text[metadata_start + len(METADATA_BEGIN):metadata_end].strip())
+    except (json.JSONDecodeError, TypeError):
+        return text
+    if not isinstance(metadata, dict) or metadata.get("managed_by") != "syncassist" or metadata.get("role") != "template":
+        return text
+    token = metadata.get("section_token")
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-fA-F]{16}", token):
+        return text
+    sync_data = metadata.get("sync")
+    if not isinstance(sync_data, dict):
+        sync_data = {}
+        metadata["sync"] = sync_data
+    version = sync_data.get("template_version")
+    if isinstance(version, int) and not isinstance(version, bool) and version > TEMPLATE_INSTRUCTIONS_VERSION:
+        return text
+
+    updated = text
+    start_marker = "<!-- syncassist:template-instructions:begin -->"
+    end_marker = "<!-- syncassist:template-instructions:end -->"
+    marker_count = (updated.count(start_marker), updated.count(end_marker))
+    if marker_count != (0, 0):
+        if marker_count != (1, 1):
+            return text
+        start = updated.index(start_marker)
+        end_start = updated.find(end_marker, start)
+        if end_start < 0:
+            return text
+        end = end_start + len(end_marker)
+        updated = updated[:start] + _template_instructions_block() + updated[end:]
+    else:
+        legacy = (
+            "> Copy this file to `todo-task-name.md` or `done-task-name.md`, edit the title and description, then run sync.\n"
+            "> This template file is never sent to Trello."
+        )
+        if legacy in updated:
+            updated = updated.replace(legacy, _template_instructions_block(), 1)
+        else:
+            description_end = _section_marker(token, "description", "end")
+            if updated.count(description_end) != 1:
+                return text
+            insertion = description_end + "\n\n"
+            updated = updated.replace(
+                insertion,
+                insertion + _template_instructions_block() + "\n\n",
+                1,
+            )
+
+    if updated == text and version == TEMPLATE_INSTRUCTIONS_VERSION:
+        return text
+    sync_data["template_version"] = TEMPLATE_INSTRUCTIONS_VERSION
+    metadata_json = _json_for_comment(metadata)
+    updated_metadata_start = updated.index(METADATA_BEGIN)
+    updated_metadata_end = updated.index(METADATA_END, updated_metadata_start + len(METADATA_BEGIN))
+    return (
+        updated[:updated_metadata_start + len(METADATA_BEGIN)]
+        + "\n"
+        + metadata_json
+        + "\n"
+        + updated[updated_metadata_end:]
     )
 
 
@@ -1439,6 +1519,13 @@ def _ensure_new_card_template(plan_dir: Path) -> None:
     if path.exists():
         if not path.is_file():
             raise SyncAssistError(f"new-card template path is not a regular file: {path.name}")
+        existing = path.read_text(encoding="utf-8")
+        updated = _upgrade_template_instructions(existing)
+        if updated != existing:
+            current = path.read_text(encoding="utf-8")
+            if current.replace("\r\n", "\n") != existing.replace("\r\n", "\n"):
+                raise ConcurrentFileChange(f"template changed during synchronization: {path.name}")
+            _atomic_write(path, updated)
         return
     _atomic_write(path, _render_new_card_template())
 
@@ -1792,6 +1879,8 @@ def _failure_advice(exc: Exception | None = None) -> str:
             "Move the project folder to a shorter path and run sync.py again. SyncAssist already "
             "shortens generated filenames when that is enough."
         )
+    if isinstance(exc, SyncAssistError) and "recovery journal was preserved" in str(exc).casefold():
+        return "Run sync.py again; SyncAssist will use the saved Trello receipts to retry reconciliation without recreating the card."
     return (
         "Fix the reported issue and run sync.py again. Keep existing PLAN/ files until "
         "synchronization completes."
@@ -3028,12 +3117,10 @@ def _sync_checklists(
 ) -> None:
     remote_checklists = _checklist_by_id(bundle)
     resolved_checklists: dict[str, str] = {}
+    resolved_items: dict[str, str] = {}
     local_checklists = list(local_projection.get("checklists", []))
     deleted_checklist_ids = set(deletions.get("checklists", []))
-    current_checklist_ids = [
-        checklist_id for checklist_id in remote_checklists if checklist_id not in deleted_checklist_ids
-    ]
-    for checklist_index, local_checklist in enumerate(local_checklists):
+    for local_checklist in local_checklists:
         local_id = str(local_checklist["id"])
         if local_id.startswith("new:"):
             result = journal.run(
@@ -3042,10 +3129,10 @@ def _sync_checklists(
                     "card_id": card_id,
                     "local_id": local_id,
                     "name": local_checklist["name"],
-                    "pos": checklist_index,
+                    "pos": "bottom",
                 },
-                lambda value=local_checklist, pos=checklist_index: api.create_checklist(
-                    card_id, value["name"], pos
+                lambda value=local_checklist: api.create_checklist(
+                    card_id, value["name"], "bottom"
                 ),
             )
             remote_id = _trello_id(result)
@@ -3060,47 +3147,34 @@ def _sync_checklists(
         resolved_checklists.get(str(checklist["id"]), str(checklist["id"]))
         for checklist in local_checklists
     ]
-    reorder_checklists = current_checklist_ids != desired_checklist_ids
 
     remote_item_parents: dict[str, str] = {}
     remote_items_by_id: dict[str, Mapping[str, Any]] = {}
     remote_item_orders: dict[str, list[str]] = {}
     for checklist_id, checklist in remote_checklists.items():
-        item_ids = list(_item_by_id(checklist))
+        checklist_items = _item_by_id(checklist)
+        item_ids = list(checklist_items)
         remote_item_orders[checklist_id] = item_ids
         for item_id in item_ids:
             remote_item_parents[item_id] = checklist_id
-            remote_items_by_id[item_id] = _item_by_id(checklist)[item_id]
-    reorder_items: dict[str, bool] = {}
-    for checklist, remote_id in zip(local_checklists, desired_checklist_ids):
-        desired_ids = [
-            str(item["id"]) for item in checklist.get("items", []) if not str(item["id"]).startswith("new:")
-        ]
-        current_ids = [
-            item_id
-            for item_id in remote_item_orders.get(remote_id, [])
-            if remote_item_parents.get(item_id) == remote_id and item_id in desired_ids
-        ]
-        reorder_items[remote_id] = current_ids != desired_ids
+            remote_items_by_id[item_id] = checklist_items[item_id]
 
-    for checklist_index, (local_checklist, remote_id) in enumerate(zip(local_checklists, desired_checklist_ids)):
-        if not str(local_checklist["id"]).startswith("new:"):
-            remote_checklist = remote_checklists[remote_id]
-            checklist_fields: dict[str, Any] = {}
-            if str(remote_checklist.get("name", "")) != str(local_checklist.get("name", "")):
-                checklist_fields["name"] = local_checklist["name"]
-            if reorder_checklists:
-                checklist_fields["pos"] = checklist_index
-            if checklist_fields:
-                journal.run(
-                    "update_checklist",
-                    {"checklist_id": remote_id, **checklist_fields},
-                    lambda checklist_id=remote_id, fields=checklist_fields: api.update_checklist(
-                        checklist_id, fields
-                    ),
-                )
-        remote_checklist = remote_checklists.get(remote_id, {"checkItems": []})
-        for item_index, local_item in enumerate(local_checklist.get("items", [])):
+    for local_checklist, remote_id in zip(local_checklists, desired_checklist_ids):
+        remote_checklist = remote_checklists[remote_id]
+        checklist_fields: dict[str, Any] = {}
+        if str(remote_checklist.get("name", "")) != str(local_checklist.get("name", "")):
+            checklist_fields["name"] = local_checklist["name"]
+        if checklist_fields:
+            journal.run(
+                "update_checklist",
+                {"checklist_id": remote_id, **checklist_fields},
+                lambda checklist_id=remote_id, fields=checklist_fields: api.update_checklist(
+                    checklist_id, fields
+                ),
+            )
+            remote_checklists[remote_id] = {**remote_checklist, **checklist_fields}
+        remote_item_orders.setdefault(remote_id, [])
+        for local_item in local_checklist.get("items", []):
             item_id = str(local_item["id"])
             if item_id.startswith("new:"):
                 result = journal.run(
@@ -3109,14 +3183,32 @@ def _sync_checklists(
                         "checklist_id": remote_id,
                         "local_id": item_id,
                         "name": local_item["name"],
-                        "pos": item_index,
+                        "pos": "bottom",
                     },
-                    lambda value=local_item, checklist_id=remote_id, pos=item_index: api.create_checkitem(
-                    checklist_id, value["name"], pos
+                    lambda value=local_item, checklist_id=remote_id: api.create_checkitem(
+                        checklist_id, value["name"], "bottom"
                     ),
                 )
-                if not ID_PATTERN.fullmatch(_trello_id(result)):
+                remote_item_id = _trello_id(result)
+                if not ID_PATTERN.fullmatch(remote_item_id):
                     raise AmbiguousOperation("created checklist item has no ID")
+                resolved_items[item_id] = remote_item_id
+                created_item = dict(result) if isinstance(result, Mapping) else {"id": remote_item_id}
+                created_item.setdefault("name", local_item["name"])
+                created_item.setdefault("state", "incomplete")
+                remote_items_by_id[remote_item_id] = created_item
+                remote_item_parents[remote_item_id] = remote_id
+                remote_item_orders[remote_id].append(remote_item_id)
+                desired_state = _normalise_state(local_item.get("state"))
+                if desired_state != _normalise_state(created_item.get("state")):
+                    journal.run(
+                        "update_checkitem",
+                        {"card_id": card_id, "item_id": remote_item_id, "state": desired_state},
+                        lambda created_id=remote_item_id, state=desired_state: api.update_checkitem(
+                            card_id, created_id, {"state": state}
+                        ),
+                    )
+                    remote_items_by_id[remote_item_id] = {**created_item, "state": desired_state}
                 continue
             remote_item = remote_items_by_id.get(item_id)
             if remote_item is None:
@@ -3129,13 +3221,49 @@ def _sync_checklists(
                 fields["state"] = desired_state
             if remote_item_parents.get(item_id) != remote_id:
                 fields["idChecklist"] = remote_id
-            if reorder_items.get(remote_id):
-                fields["pos"] = item_index
             if fields:
                 journal.run(
                     "update_checkitem",
                     {"card_id": card_id, "item_id": item_id, **fields},
                     lambda item_id=item_id, fields=fields: api.update_checkitem(card_id, item_id, fields),
+                )
+                remote_items_by_id[item_id] = {**remote_item, **fields}
+                old_parent = remote_item_parents.get(item_id)
+                if old_parent != remote_id:
+                    if old_parent:
+                        remote_item_orders[old_parent] = [
+                            value for value in remote_item_orders.get(old_parent, []) if value != item_id
+                        ]
+                    remote_item_orders[remote_id].append(item_id)
+                    remote_item_parents[item_id] = remote_id
+
+    current_checklist_ids = [
+        checklist_id for checklist_id in remote_checklists if checklist_id not in deleted_checklist_ids
+    ]
+    if current_checklist_ids != desired_checklist_ids:
+        for checklist_id in reversed(desired_checklist_ids):
+            journal.run(
+                "update_checklist",
+                {"checklist_id": checklist_id, "pos": "top"},
+                lambda checklist_id=checklist_id: api.update_checklist(checklist_id, {"pos": "top"}),
+            )
+
+    for local_checklist, remote_id in zip(local_checklists, desired_checklist_ids):
+        desired_item_ids = [
+            resolved_items.get(str(item["id"]), str(item["id"]))
+            for item in local_checklist.get("items", [])
+        ]
+        current_item_ids = [
+            item_id
+            for item_id in remote_item_orders.get(remote_id, [])
+            if item_id in desired_item_ids
+        ]
+        if current_item_ids != desired_item_ids:
+            for item_id in reversed(desired_item_ids):
+                journal.run(
+                    "update_checkitem",
+                    {"card_id": card_id, "item_id": item_id, "pos": "top"},
+                    lambda item_id=item_id: api.update_checkitem(card_id, item_id, {"pos": "top"}),
                 )
     for item_id in deletions.get("items", []):
         parent_id = remote_item_parents.get(item_id)
@@ -3345,33 +3473,90 @@ def _pending_replay_safe(parsed: ParsedDocument) -> bool:
     )
 
 
+def _is_pending_position_update(operation: Mapping[str, Any]) -> bool:
+    kind = operation.get("kind")
+    payload = operation.get("payload", {})
+    if not isinstance(payload, Mapping) or payload.get("pos") != "top":
+        return False
+    if kind == "update_checklist":
+        return set(payload) == {"checklist_id", "pos"}
+    if kind == "update_checkitem":
+        return set(payload) == {"card_id", "item_id", "pos"}
+    return False
+
+
 def _pending_expected_projection(pending: Mapping[str, Any]) -> dict[str, Any] | None:
     expected = copy.deepcopy(dict(pending["desired"]))
     checklist_ids: dict[str, str] = {}
     item_ids: dict[str, str] = {}
     for operation in pending["operations"]:
-        if operation.get("state") != "confirmed":
-            return None
         payload = operation.get("payload", {})
         receipt = operation.get("receipt")
         remote_id = operation.get("remote_id")
         if not remote_id and isinstance(receipt, Mapping):
             remote_id = receipt.get("id")
         if operation.get("kind") == "create_checklist":
+            if operation.get("state") != "confirmed":
+                return None
             local_id = str(payload.get("local_id", ""))
             if not TEMP_ID_PATTERN.fullmatch(local_id) or not ID_PATTERN.fullmatch(str(remote_id or "")):
                 return None
             checklist_ids[local_id] = str(remote_id)
         elif operation.get("kind") == "create_checkitem":
+            if operation.get("state") != "confirmed":
+                return None
             local_id = str(payload.get("local_id", ""))
             if not TEMP_ID_PATTERN.fullmatch(local_id) or not ID_PATTERN.fullmatch(str(remote_id or "")):
                 return None
             item_ids[local_id] = str(remote_id)
+        elif not _is_pending_position_update(operation) and operation.get("state") != "confirmed":
+            return None
     for checklist in expected.get("checklists", []):
         checklist["id"] = checklist_ids.get(str(checklist["id"]), str(checklist["id"]))
         for item in checklist.get("items", []):
             item["id"] = item_ids.get(str(item["id"]), str(item["id"]))
+    expected_checklist_ids = {str(checklist["id"]) for checklist in expected.get("checklists", [])}
+    expected_item_ids = {
+        str(item["id"])
+        for checklist in expected.get("checklists", [])
+        for item in checklist.get("items", [])
+    }
+    for operation in pending["operations"]:
+        if not _is_pending_position_update(operation):
+            continue
+        payload = operation["payload"]
+        if operation.get("kind") == "update_checklist":
+            if str(payload.get("checklist_id", "")) not in expected_checklist_ids:
+                return None
+        elif str(payload.get("item_id", "")) not in expected_item_ids:
+            return None
     return expected
+
+
+def _same_projection_ignoring_checklist_order(
+    expected: Mapping[str, Any], remote: Mapping[str, Any]
+) -> bool:
+    if any(expected.get(key) != remote.get(key) for key in ("title", "description", "status", "label_ids")):
+        return False
+    expected_checklists = {str(item["id"]): item for item in expected.get("checklists", [])}
+    remote_checklists = {str(item["id"]): item for item in remote.get("checklists", [])}
+    if expected_checklists.keys() != remote_checklists.keys():
+        return False
+    for checklist_id, expected_checklist in expected_checklists.items():
+        remote_checklist = remote_checklists[checklist_id]
+        if expected_checklist.get("name") != remote_checklist.get("name"):
+            return False
+        expected_items = {
+            str(item["id"]): (item.get("name"), item.get("state"))
+            for item in expected_checklist.get("items", [])
+        }
+        remote_items = {
+            str(item["id"]): (item.get("name"), item.get("state"))
+            for item in remote_checklist.get("items", [])
+        }
+        if expected_items != remote_items:
+            return False
+    return True
 
 
 def _clear_pending(parsed: ParsedDocument) -> ParsedDocument:
@@ -3403,6 +3588,72 @@ def _pending_matches_remote(
     if expected_projection == dict(remote_projection):
         return True
     return False
+
+
+def _recover_pending_checklist_order(
+    api: Any,
+    parsed: ParsedDocument,
+    bundle: Mapping[str, Any],
+    remote_projection: Mapping[str, Any],
+    now: str,
+    report: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    pending = (parsed.metadata.get("sync") or {}).get("pending")
+    if not isinstance(pending, Mapping):
+        return None
+    if not _validate_pending_record(pending, _reference_card(parsed.reference)):
+        return None
+    if not _pending_has_card_scope(parsed, pending) or pending.get("desired") != parsed.projection:
+        return None
+    expected = _pending_expected_projection(pending)
+    if expected is None or not _same_projection_ignoring_checklist_order(expected, remote_projection):
+        return None
+    if expected == dict(remote_projection):
+        return None
+
+    card_id = str(parsed.metadata["trello_card_id"])
+    journal = OperationJournal(parsed.path, parsed, parsed.projection, now, report)
+    journal.operations = copy.deepcopy(pending["operations"])
+    expected_checklists = expected.get("checklists", [])
+    remote_checklists = remote_projection.get("checklists", [])
+    if [item["id"] for item in expected_checklists] != [item["id"] for item in remote_checklists]:
+        for checklist in reversed(expected_checklists):
+            checklist_id = str(checklist["id"])
+            journal.run(
+                "update_checklist",
+                {"checklist_id": checklist_id, "pos": "top"},
+                lambda checklist_id=checklist_id: api.update_checklist(
+                    checklist_id, {"pos": "top"}
+                ),
+            )
+
+    remote_by_id = {str(item["id"]): item for item in remote_checklists}
+    for checklist in expected_checklists:
+        checklist_id = str(checklist["id"])
+        remote_checklist = remote_by_id[checklist_id]
+        expected_item_ids = [str(item["id"]) for item in checklist.get("items", [])]
+        remote_item_ids = [str(item["id"]) for item in remote_checklist.get("items", [])]
+        if expected_item_ids != remote_item_ids:
+            for item_id in reversed(expected_item_ids):
+                journal.run(
+                    "update_checkitem",
+                    {"card_id": card_id, "item_id": item_id, "pos": "top"},
+                    lambda item_id=item_id: api.update_checkitem(
+                        card_id, item_id, {"pos": "top"}
+                    ),
+                )
+
+    refreshed = _preserve_scope_sections(
+        _get_card_bundle(api, card_id, parsed.reference), bundle
+    )
+    if _bundle_has_failed_resources(refreshed):
+        raise IncompleteInventory(_incomplete_bundle_message(refreshed) + " while recovering checklist order")
+    recovered_projection = build_remote_projection(refreshed)
+    if recovered_projection != expected:
+        raise SyncAssistError(
+            "Trello did not retain the requested checklist order; the recovery record was kept for the next sync"
+        )
+    return refreshed, recovered_projection
 
 
 def _pending_create_matches(
@@ -3599,6 +3850,14 @@ def _process_card(
         report["created"] += 1
         return
     if _pending_requires_review(parsed):
+        pending_conflict = (parsed.metadata.get("sync") or {}).get("conflict")
+        if not _pending_matches_remote(parsed, bundle, remote_projection):
+            recovered = _recover_pending_checklist_order(
+                api, parsed, bundle, remote_projection, now, report
+            )
+            if recovered is not None:
+                bundle, remote_projection = recovered
+                parsed = parse_document(parsed.path, parsed.path.read_text(encoding="utf-8"))
         if _pending_matches_remote(parsed, bundle, remote_projection):
             reconciled = _write_reconciled(
                 config,
@@ -3610,6 +3869,14 @@ def _process_card(
                 reference=bundle,
                 base=remote_projection,
             )
+            if isinstance(pending_conflict, Mapping) and pending_conflict.get("conflict_id"):
+                _mark_conflict_resolved(
+                    config.plan_dir,
+                    card_id,
+                    str(pending_conflict["conflict_id"]),
+                    "local",
+                    now,
+                )
             report["updated"] += 1
             report["renamed"] += int(reconciled)
             return
@@ -3910,8 +4177,30 @@ def _process_new_card(
     if _bundle_has_failed_resources(refreshed):
         raise IncompleteInventory(_incomplete_bundle_message(refreshed) + " after card creation")
     final_projection = build_remote_projection(refreshed)
-    if final_projection != provisional.projection:
-        raise RemoteError("created card did not match the local template")
+    pending_operations = (provisional.metadata.get("sync") or {}).get("pending")
+    expected_projection = (
+        _pending_expected_projection(pending_operations)
+        if isinstance(pending_operations, Mapping)
+        else provisional.projection
+    )
+    if expected_projection is not None and final_projection != expected_projection:
+        recovered = _recover_pending_checklist_order(
+            api, provisional, refreshed, final_projection, now, report
+        )
+        if recovered is not None:
+            refreshed, final_projection = recovered
+            provisional = parse_document(provisional.path, provisional.path.read_text(encoding="utf-8"))
+            pending_operations = (provisional.metadata.get("sync") or {}).get("pending")
+            expected_projection = (
+                _pending_expected_projection(pending_operations)
+                if isinstance(pending_operations, Mapping)
+                else provisional.projection
+            )
+    if expected_projection is None or final_projection != expected_projection:
+        raise SyncAssistError(
+            "Trello created the card but its returned contents did not match the local file; "
+            "the recovery journal was preserved for the next sync"
+        )
     all_bundles = dict(bundles)
     all_bundles[card_id] = refreshed
     final_filename = _new_card_filename(

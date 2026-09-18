@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.5] - 2026-09-18
+
+### Fixed
+
+- Created checklist entries at the end, then restored the requested order and completion state before verifying a new card.
+- Automatically recovered confirmed checklist/item creations whose Trello positions differed, using recorded IDs without creating duplicate cards or entries.
+- Versioned the generated card template, added card limits and checklist marker syntax, and made sync create a missing model or upgrade an older managed model in place.
+
 ## [1.2.4] - 2026-09-18
 
 ### Fixed

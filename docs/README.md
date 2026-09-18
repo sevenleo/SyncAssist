@@ -130,14 +130,15 @@ The suffix appears only for duplicate titles or titles without useful text. URLs
 
 ## Create a new card from the project
 
-On every successful run, SyncAssist keeps the template `PLAN/_modelo-card.md` in the `PLAN/` root. The template is reserved and is never sent to Trello.
+At the start of each run, SyncAssist creates `PLAN/_modelo-card.md` if it is missing and upgrades instructions in an older managed template. The template is reserved and is never sent to Trello; updates preserve the rest of the file.
 
 To create a new task:
 
 1. Copy `PLAN/_modelo-card.md` to a name starting with `todo-` or `done-`.
-2. Edit the first title `# New task` and the contents of `## Description`.
-3. If necessary, adjust checklists and `content.label_ids` in the technical block, using only IDs that exist on the board.
-4. Run `python sync.py`.
+2. Edit the first title `# New task` and the contents of `## Description`. Trello allows titles up to 163 characters and descriptions up to 16,384 characters.
+3. Add checklists in the visible `## Checklists` section with a unique temporary ID on every new heading and item. For example, use `### Validation <!-- syncassist:checklist=new:validation -->` and `- [ ] Run tests <!-- syncassist:item=new:run-tests -->`; use `- [x]` for an already completed item.
+4. If needed, set `content.label_ids` in the technical block to IDs that exist on the configured board. Keep existing checklist/item IDs intact; SyncAssist replaces new `new:<key>` IDs with Trello IDs after creation.
+5. Run `python sync.py`.
 
 Example:
 
