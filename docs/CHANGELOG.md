@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.2.4] - 2026-09-18
+
+### Fixed
+
+- Standardized synchronization, import and CLI failure guidance in English.
+
+## [1.2.3] - 2026-09-18
+
+### Fixed
+
+- Preserved existing Trello titles and descriptions over SyncAssist's write limits, while keeping those limits for new or edited values.
+- Included the underlying projection-validation reason in incomplete-card errors.
+
+## [1.2.2] - 2026-09-18
+
+### Fixed
+
+- Included card names, detailed remote failure causes and suggested next steps in failure logs; partial runs and skipped cleanup are now explicit.
+- Shortened generated card filenames when a deep Windows project path would exceed `MAX_PATH`, while keeping the full card title in the document.
+
 ## [1.2.1] - 2026-09-17
 
 ### Documentation

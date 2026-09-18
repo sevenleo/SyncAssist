@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tempfile
 import urllib.error
 import unittest
@@ -164,6 +165,21 @@ class FilenameTests(unittest.TestCase):
     def test_plan_path_length_is_checked_before_writes(self):
         with self.assertRaises(SyncAssistError):
             _assert_safe_plan_file(Path("C:/" + "a" * 270 + ".md"), Path("C:/"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows path length rule")
+    def test_card_filename_shortens_for_a_deep_project_path(self):
+        card_id = "abcdef1234567890abcdef12"
+        plan_dir = Path("C:/") / ("p" * 215) / "PLAN"
+
+        filename = choose_filename(
+            "todo",
+            "A very long card title " * 10,
+            card_id,
+            plan_dir=plan_dir,
+        )
+
+        self.assertLess(len(str((plan_dir / filename).resolve())), 260)
+        self.assertIn(card_id[-6:], filename)
 
     def test_unmanaged_markdown_is_ignored_even_with_a_card_like_name(self):
         root = Path(tempfile.mkdtemp())
@@ -962,7 +978,7 @@ class SetupTests(unittest.TestCase):
             self.assertIn(expected, help_text)
 
     def test_product_version_matches_release(self):
-        self.assertEqual(SCRIPT_VERSION, "1.2.0")
+        self.assertEqual(SCRIPT_VERSION, "1.2.4")
 
     def complete_env(self):
         return {
@@ -1964,6 +1980,66 @@ class SyncOnceTests(unittest.TestCase):
         report = sync_once(config, api, now="2026-09-14T00:00:00Z")
 
         self.assertEqual(report["failures"], 1)
+        self.assertEqual(plan_card_files(root), [])
+
+    def test_incomplete_remote_read_explains_missing_file_and_next_steps(self):
+        root = Path(tempfile.mkdtemp())
+        config = self.make_config(root)
+        api = FakeApi(sample_bundle())
+
+        def incomplete_bundle(card_id):
+            raise IncompleteInventory(f"incomplete card resources for {card_id}: attachments")
+
+        api.get_card_bundle = incomplete_bundle
+        progress = []
+        report = sync_once(
+            config,
+            api,
+            now="2026-09-14T00:00:00Z",
+            progress=progress.append,
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+        _print_report(report, output=output, errors=errors)
+
+        self.assertEqual(report["failures"], 1)
+        self.assertEqual(plan_card_files(root), [])
+        self.assertTrue(any("finished with errors" in message for message in progress))
+        self.assertIn("Card", errors.getvalue())
+        self.assertIn("attachments", errors.getvalue())
+        self.assertIn("not created or updated", errors.getvalue())
+        self.assertIn("Run sync.py again", errors.getvalue())
+        self.assertIn("Automatic cleanup was skipped", errors.getvalue())
+
+    def test_preserves_an_existing_trello_title_over_the_write_limit(self):
+        root = Path(tempfile.mkdtemp())
+        bundle = sample_bundle()
+        title = ("A long legacy Trello title " * 8).strip()
+        self.assertGreater(len(title), 163)
+        bundle["card"]["name"] = title
+        api = FakeApi(bundle)
+        config = self.make_config(root)
+
+        first = sync_once(config, api, now="2026-09-14T00:00:00Z")
+        local_file = next_plan_card(root)
+        parsed = parse_document(local_file, local_file.read_text(encoding="utf-8"))
+        second = sync_once(config, api, now="2026-09-14T00:01:00Z")
+
+        self.assertEqual(first["created"], 1)
+        self.assertEqual(parsed.projection["title"], title)
+        self.assertEqual(second["failures"], 0)
+        self.assertEqual(second["unchanged"], 1)
+
+    def test_invalid_projection_error_keeps_the_validation_reason(self):
+        root = Path(tempfile.mkdtemp())
+        bundle = sample_bundle()
+        bundle["checklists"] = [{"id": "bad-id", "name": "Checklist", "checkItems": []}]
+        api = FakeApi(bundle)
+
+        report = sync_once(self.make_config(root), api, now="2026-09-14T00:00:00Z")
+
+        self.assertEqual(report["failures"], 1)
+        self.assertIn("invalid or duplicate checklist ID: bad-id", report["errors"][0]["message"])
         self.assertEqual(plan_card_files(root), [])
 
     def test_import_records_the_bound_list_name(self):

@@ -79,7 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.4"
 SCHEMA_VERSION = 1
 API_BASE = "https://api.trello.com/1"
 METADATA_BEGIN = "<!-- syncassist:metadata"
@@ -1075,6 +1075,50 @@ def slugify_title(title: str) -> str:
     return value
 
 
+def _windows_path_length(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _fit_filename_to_plan_dir(
+    plan_dir: Path, filename: str, card_id: str, suffix: str | None = None
+) -> str:
+    if os.name != "nt":
+        return filename
+    full_path = str((plan_dir / filename).resolve())
+    if _windows_path_length(full_path) < 260:
+        return filename
+
+    probe = str((plan_dir / "x").resolve())
+    directory_length = _windows_path_length(probe) - 1
+    available = 259 - directory_length
+    status, _, slug = Path(filename).stem.partition("-")
+    prefix = f"{status}-"
+    suffix_lengths = [len(suffix)] if suffix else []
+    suffix_lengths.extend(length for length in (24, 16, 12, 8, 6) if length not in suffix_lengths)
+    for id_length in suffix_lengths:
+        id_suffix = f"--{card_id[-id_length:].lower()}"
+        slug_budget = available - _windows_path_length(prefix + id_suffix + ".md")
+        shortened = ""
+        used = 0
+        for character in slug:
+            width = _windows_path_length(character)
+            if used + width > slug_budget:
+                break
+            shortened += character
+            used += width
+        shortened = shortened.rstrip("-.")
+        if shortened:
+            return f"{prefix}{shortened}{id_suffix}.md"
+
+    for id_length in (24, 16, 12, 8, 6, 4, 2, 1):
+        fallback = f"{prefix}{card_id[-id_length:].lower()}.md"
+        if _windows_path_length(fallback) <= available:
+            return fallback
+    raise SyncAssistError(
+        "project path is too long to create a card file; move the project to a shorter path"
+    )
+
+
 def choose_filename(
     status: str,
     title: str,
@@ -1082,6 +1126,7 @@ def choose_filename(
     *,
     duplicate: bool = False,
     suffix: str | None = None,
+    plan_dir: Path | None = None,
 ) -> str:
     """Create the filename while keeping identity in Markdown metadata."""
 
@@ -1090,14 +1135,20 @@ def choose_filename(
         raise ValueError("status must be 'todo' or 'done'")
     slug = slugify_title(title)
     visible_title = _visible_title_for_slug(title).strip()
+    filename_suffix = None
     fallback_slug = slug == "card" and (
         not any(character.isalnum() for character in visible_title)
         or visible_title.upper() in RESERVED_WINDOWS_NAMES
     )
     if duplicate or fallback_slug:
-        suffix = suffix or card_id[-6:].lower()
-        slug = f"{slug}--{suffix}"
-    return f"{normalized_status}-{slug}.md"
+        filename_suffix = suffix or card_id[-6:].lower()
+        slug = f"{slug}--{filename_suffix}"
+    filename = f"{normalized_status}-{slug}.md"
+    return (
+        _fit_filename_to_plan_dir(plan_dir, filename, card_id, filename_suffix)
+        if plan_dir is not None
+        else filename
+    )
 
 
 def _section_marker(token: str, section: str, edge: str) -> str:
@@ -1695,9 +1746,56 @@ def _new_report() -> dict[str, Any]:
     }
 
 
-def _report_error(report: dict[str, Any], card_id: str | None, message: str) -> None:
+def _report_error(
+    report: dict[str, Any],
+    card_id: str | None,
+    message: str,
+    *,
+    card_name: str | None = None,
+    advice: str | None = None,
+) -> None:
     report["failures"] += 1
-    report["errors"].append({"card_id": card_id, "message": message})
+    report["errors"].append(
+        {
+            "card_id": card_id,
+            "card_name": card_name,
+            "message": message,
+            "advice": advice or _failure_advice(),
+        }
+    )
+
+
+def _failure_advice(exc: Exception | None = None) -> str:
+    if isinstance(exc, IncompleteInventory):
+        return (
+            "Run sync.py again. If the issue persists, open the card in Trello, check the resource "
+            "named in the detail, and share this full message for investigation."
+        )
+    if isinstance(exc, RemoteError):
+        if exc.status == 401:
+            return "Check the Trello API key and generate a new token, then run sync.py again."
+        if exc.status == 403:
+            return "Confirm that the token's account can access the configured board and list."
+        if exc.status == 404:
+            return "Confirm in Trello that the card still exists and is accessible in this list."
+        if exc.status == 429:
+            return "Wait a few minutes, then run sync.py again."
+        if exc.status is not None and exc.status >= 500:
+            return "Check whether Trello is available, wait a few minutes, then try again."
+        return "Check your internet connection and Trello access, then run sync.py again."
+    if isinstance(exc, (urllib.error.URLError, TimeoutError)):
+        return "Check your internet connection, then run sync.py again."
+    if isinstance(exc, SyncAssistError) and any(
+        marker in str(exc).casefold() for marker in ("max_path", "project path is too long")
+    ):
+        return (
+            "Move the project folder to a shorter path and run sync.py again. SyncAssist already "
+            "shortens generated filenames when that is enough."
+        )
+    return (
+        "Fix the reported issue and run sync.py again. Keep existing PLAN/ files until "
+        "synchronization completes."
+    )
 
 
 def _report_warning(report: dict[str, Any], card_id: str | None, message: str) -> None:
@@ -1734,7 +1832,7 @@ def _path_is_within(path: Path, parent: Path) -> bool:
 
 
 def _assert_safe_plan_file(path: Path, plan_dir: Path) -> None:
-    if os.name == "nt" and len(str(path.resolve())) >= 260:
+    if os.name == "nt" and _windows_path_length(str(path.resolve())) >= 260:
         raise SyncAssistError(f"path exceeds Windows MAX_PATH safety limit: {path.name}")
     try:
         relative = path.absolute().relative_to(plan_dir.absolute())
@@ -2021,6 +2119,12 @@ def _print_import_report(result: ImportResult, *, output: Any = sys.stdout, erro
     )
     for message in result.errors:
         print(f"ERROR [import] {message}", file=errors)
+    if result.failed:
+        print(
+            "  Next step: keep the TXT files in PLAN/, fix the reported issues, and run "
+            "sync.py --import again.",
+            file=errors,
+        )
 
 
 class SyncLock:
@@ -2130,6 +2234,7 @@ def _filename_plan(
     local_documents: Mapping[str, ParsedDocument] | None = None,
     *,
     occupied_names: Iterable[str] | None = None,
+    plan_dir: Path | None = None,
 ) -> dict[str, str]:
     groups: dict[str, list[str]] = {}
     projections: dict[str, dict[str, Any]] = {}
@@ -2181,7 +2286,12 @@ def _filename_plan(
             if suffix is None:
                 raise SyncAssistError(f"unable to disambiguate card IDs for slug: {slug}")
         candidate = choose_filename(
-            projection["status"], projection["title"], card_id, duplicate=duplicate, suffix=suffix
+            projection["status"],
+            projection["title"],
+            card_id,
+            duplicate=duplicate,
+            suffix=suffix,
+            plan_dir=plan_dir,
         )
         existing = (local_documents or {}).get(card_id)
         allowed_existing = existing.path.name.casefold() if existing is not None else None
@@ -2194,6 +2304,7 @@ def _filename_plan(
                     card_id,
                     duplicate=True,
                     suffix=card_id[-length:].lower(),
+                    plan_dir=plan_dir,
                 )
                 if option.casefold() not in occupied or option.casefold() == allowed_existing:
                     candidate = option
@@ -2614,7 +2725,15 @@ def _validate_card_metadata(metadata: Mapping[str, Any], config: Config) -> None
     sync_data = metadata.get("sync")
     if not isinstance(content, Mapping) or not isinstance(sync_data, Mapping):
         raise ValueError("missing content or sync metadata")
-    _validate_projection_shape(content, temporary_ids_allowed=True)
+    reference = metadata.get("reference")
+    if not isinstance(reference, Mapping):
+        raise ValueError("reference must be a JSON object")
+    reference_card = reference.get("card")
+    _validate_projection_shape(
+        content,
+        temporary_ids_allowed=True,
+        **_remote_limit_allowances(content, reference_card),
+    )
     if metadata.get("status") not in {None, content.get("status")}:
         raise ValueError("metadata status does not match content status")
     labels = content.get("label_ids")
@@ -2631,12 +2750,9 @@ def _validate_card_metadata(metadata: Mapping[str, Any], config: Config) -> None
     base = sync_data.get("base")
     if not isinstance(base, Mapping) or sync_data.get("base_hash") != canonical_hash(base):
         raise ValueError("base snapshot hash is invalid")
+    _validate_projection_shape(base, **_remote_limit_allowances(base, reference_card))
     if not isinstance(sync_data.get("reference_hash"), str):
         raise ValueError("missing reference hash")
-    reference = metadata.get("reference")
-    if not isinstance(reference, Mapping):
-        raise ValueError("reference must be a JSON object")
-    reference_card = reference.get("card")
     if isinstance(reference_card, Mapping):
         for key, expected in (
             ("id", metadata["trello_card_id"]),
@@ -2648,16 +2764,39 @@ def _validate_card_metadata(metadata: Mapping[str, Any], config: Config) -> None
                 raise ConfigError(f"reference {key} does not match card metadata")
 
 
-def _validate_projection_shape(value: Any, *, temporary_ids_allowed: bool = False) -> None:
+def _remote_limit_allowances(
+    projection: Mapping[str, Any], reference_card: Any
+) -> dict[str, bool]:
+    if not isinstance(reference_card, Mapping):
+        return {"allow_oversized_title": False, "allow_oversized_description": False}
+    return {
+        "allow_oversized_title": (
+            len(str(projection.get("title", ""))) > TRELLO_CARD_NAME_LIMIT
+            and projection.get("title") == reference_card.get("name")
+        ),
+        "allow_oversized_description": (
+            len(str(projection.get("description", ""))) > TRELLO_CARD_DESCRIPTION_LIMIT
+            and projection.get("description") == reference_card.get("desc")
+        ),
+    }
+
+
+def _validate_projection_shape(
+    value: Any,
+    *,
+    temporary_ids_allowed: bool = False,
+    allow_oversized_title: bool = False,
+    allow_oversized_description: bool = False,
+) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("projection must be an object")
     if not isinstance(value.get("title"), str) or not isinstance(value.get("description"), str):
         raise ValueError("projection title and description must be strings")
     if not value["title"].strip():
         raise ValueError("projection title cannot be empty")
-    if len(value["title"]) > TRELLO_CARD_NAME_LIMIT:
+    if len(value["title"]) > TRELLO_CARD_NAME_LIMIT and not allow_oversized_title:
         raise ValueError("projection title exceeds Trello's card name limit")
-    if len(value["description"]) > TRELLO_CARD_DESCRIPTION_LIMIT:
+    if len(value["description"]) > TRELLO_CARD_DESCRIPTION_LIMIT and not allow_oversized_description:
         raise ValueError("projection description exceeds Trello's card description limit")
     if value.get("status") not in {"todo", "done"}:
         raise ValueError("projection status must be todo or done")
@@ -2750,7 +2889,11 @@ def _load_local_documents(
             if not path.name.lower().startswith(("todo-", "done-")):
                 raise ValueError("managed card filename must start with todo- or done-")
             parsed = parse_document(path, raw_text)
-            _validate_projection_shape(parsed.projection, temporary_ids_allowed=True)
+            _validate_projection_shape(
+                parsed.projection,
+                temporary_ids_allowed=True,
+                **_remote_limit_allowances(parsed.projection, _reference_card(parsed.reference)),
+            )
             if parsed.metadata.get("role") == "template":
                 _validate_new_card_metadata(parsed, config)
                 new_documents.append(parsed)
@@ -3138,15 +3281,21 @@ def _pending_requires_review(parsed: ParsedDocument) -> bool:
     return True
 
 
-def _validate_pending_record(pending: Mapping[str, Any]) -> bool:
+def _validate_pending_record(
+    pending: Mapping[str, Any], reference_card: Any = None
+) -> bool:
     base = pending.get("base")
     desired = pending.get("desired")
     operations = pending.get("operations")
     if not isinstance(base, Mapping) or not isinstance(desired, Mapping) or not isinstance(operations, list):
         return False
     try:
-        _validate_projection_shape(base)
-        _validate_projection_shape(desired, temporary_ids_allowed=True)
+        _validate_projection_shape(base, **_remote_limit_allowances(base, reference_card))
+        _validate_projection_shape(
+            desired,
+            temporary_ids_allowed=True,
+            **_remote_limit_allowances(desired, reference_card),
+        )
     except ValueError:
         return False
     allowed_kinds = {
@@ -3189,7 +3338,7 @@ def _pending_replay_safe(parsed: ParsedDocument) -> bool:
     pending = (parsed.metadata.get("sync") or {}).get("pending")
     return (
         isinstance(pending, Mapping)
-        and _validate_pending_record(pending)
+        and _validate_pending_record(pending, _reference_card(parsed.reference))
         and _pending_has_card_scope(parsed, pending)
         and pending.get("desired") == parsed.projection
         and all(operation.get("state") == "not_sent" for operation in pending["operations"])
@@ -3242,7 +3391,7 @@ def _pending_matches_remote(
     pending = (parsed.metadata.get("sync") or {}).get("pending")
     if not isinstance(pending, Mapping):
         return False
-    if not _validate_pending_record(pending):
+    if not _validate_pending_record(pending, _reference_card(parsed.reference)):
         return False
     if not _pending_has_card_scope(parsed, pending):
         return False
@@ -3312,7 +3461,7 @@ def _resolve_existing_conflict(
         bundle,
     )
     if _bundle_has_failed_resources(latest_bundle):
-        raise IncompleteInventory("remote card reference is incomplete before conflict resolution")
+        raise IncompleteInventory(_incomplete_bundle_message(latest_bundle) + " before conflict resolution")
     latest_projection = build_remote_projection(latest_bundle)
     if latest_projection != remote_projection:
         _conflict_info(
@@ -3395,7 +3544,7 @@ def _resolve_existing_conflict(
         latest_bundle,
     )
     if _bundle_has_failed_resources(refreshed):
-        raise IncompleteInventory("remote card reference is incomplete after conflict resolution")
+        raise IncompleteInventory(_incomplete_bundle_message(refreshed) + " after conflict resolution")
     final_projection = build_remote_projection(refreshed)
     refreshed_bundles = dict(bundles)
     refreshed_bundles[str(parsed.metadata["trello_card_id"])] = refreshed
@@ -3546,7 +3695,7 @@ def _process_card(
             _get_card_bundle(api, card_id, parsed.reference), bundle
         )
         if _bundle_has_failed_resources(latest_bundle):
-            raise IncompleteInventory("remote card reference is incomplete before local push")
+            raise IncompleteInventory(_incomplete_bundle_message(latest_bundle) + " before local push")
         latest_projection = build_remote_projection(latest_bundle)
         if latest_projection != remote_projection or (latest_bundle.get("card") or {}).get("closed"):
             _process_card(
@@ -3572,7 +3721,7 @@ def _process_card(
             _get_card_bundle(api, card_id, parsed_after.reference), latest_bundle
         )
         if _bundle_has_failed_resources(refreshed):
-            raise IncompleteInventory("remote card reference is incomplete after local push")
+            raise IncompleteInventory(_incomplete_bundle_message(refreshed) + " after local push")
         final_projection = build_remote_projection(refreshed)
         renamed = _write_reconciled(
             config,
@@ -3617,7 +3766,11 @@ def _new_card_filename(
         if existing_id != card_id
     )
     filename = choose_filename(
-        projection["status"], projection["title"], card_id, duplicate=duplicate
+        projection["status"],
+        projection["title"],
+        card_id,
+        duplicate=duplicate,
+        plan_dir=plan_dir,
     )
     if filename.casefold() not in occupied or filename.casefold() == source_name:
         return filename
@@ -3628,6 +3781,7 @@ def _new_card_filename(
             card_id,
             duplicate=True,
             suffix=card_id[-length:].lower(),
+            plan_dir=plan_dir,
         )
         if filename.casefold() not in occupied or filename.casefold() == source_name:
             return filename
@@ -3754,7 +3908,7 @@ def _process_new_card(
         _get_card_bundle(api, card_id, provisional.reference), created_bundle
     )
     if _bundle_has_failed_resources(refreshed):
-        raise IncompleteInventory("remote card reference is incomplete after card creation")
+        raise IncompleteInventory(_incomplete_bundle_message(refreshed) + " after card creation")
     final_projection = build_remote_projection(refreshed)
     if final_projection != provisional.projection:
         raise RemoteError("created card did not match the local template")
@@ -3881,14 +4035,32 @@ def _validate_bundle_identity(
     if board_id != config.board_id or list_id != config.list_id:
         raise IncompleteInventory(f"card bundle scope mismatch: {card_id}")
     try:
-        _validate_projection_shape(build_remote_projection(bundle))
+        _validate_projection_shape(
+            build_remote_projection(bundle),
+            allow_oversized_title=True,
+            allow_oversized_description=True,
+        )
     except ValueError as exc:
-        raise IncompleteInventory(f"card bundle projection is invalid: {card_id}") from exc
+        raise IncompleteInventory(f"card bundle projection is invalid: {card_id}: {exc}") from exc
 
 
 def _bundle_has_failed_resources(bundle: Mapping[str, Any]) -> bool:
     statuses = bundle.get("resource_status")
     return isinstance(statuses, Mapping) and any(value == "failed" for value in statuses.values())
+
+
+def _incomplete_bundle_message(bundle: Mapping[str, Any]) -> str:
+    statuses = bundle.get("resource_status")
+    errors = bundle.get("resource_errors")
+    failed = []
+    if isinstance(statuses, Mapping):
+        for name, status in statuses.items():
+            if status == "failed":
+                detail = errors.get(name) if isinstance(errors, Mapping) else None
+                failed.append(f"{name} ({detail})" if detail else str(name))
+    if failed:
+        return "incomplete card reference; failed to read: " + ", ".join(failed)
+    return "incomplete remote card reference"
 
 
 def sync_once(
@@ -3954,7 +4126,15 @@ def sync_once(
                     cards_by_id.pop(card_id, None)
                     continue
                 if _bundle_has_failed_resources(bundle):
-                    _report_error(report, card_id, "remote card reference is incomplete")
+                    _report_error(
+                        report,
+                        card_id,
+                        "Incomplete Trello card read: "
+                        + _incomplete_bundle_message(bundle)
+                        + ". The local file for this card was not created or updated.",
+                        card_name=card_name,
+                        advice=_failure_advice(IncompleteInventory("incomplete bundle")),
+                    )
                     cleanup_allowed = False
                     continue
                 bundle["board_labels"] = copy.deepcopy(list(labels_by_id.values()))
@@ -3963,10 +4143,24 @@ def sync_once(
                 if exc.status == 401:
                     raise
                 cleanup_allowed = False
-                _report_error(report, card_id, f"remote card read failed: {type(exc).__name__}")
+                _report_error(
+                    report,
+                    card_id,
+                    f"remote card read failed ({type(exc).__name__}): {exc}. "
+                    "The local file for this card was not created or updated.",
+                    card_name=card_name,
+                    advice=_failure_advice(exc),
+                )
             except Exception as exc:  # one card must not stop independent cards
                 cleanup_allowed = False
-                _report_error(report, card_id, f"remote card read failed: {type(exc).__name__}")
+                _report_error(
+                    report,
+                    card_id,
+                    f"remote card read failed ({type(exc).__name__}): {exc}. "
+                    "The local file for this card was not created or updated.",
+                    card_name=card_name,
+                    advice=_failure_advice(exc),
+                )
         created_card_ids: set[str] = set()
         if new_documents:
             _emit_progress(progress, f"Processing {len(new_documents)} new file(s)...")
@@ -3987,10 +4181,22 @@ def sync_once(
                 if exc.status == 401:
                     raise
                 cleanup_allowed = False
-                _report_error(report, None, f"new card creation failed: {type(exc).__name__}")
+                _report_error(
+                    report,
+                    None,
+                    f"new card creation failed ({type(exc).__name__}): {exc}",
+                    card_name=str(parsed.projection.get("title") or ""),
+                    advice=_failure_advice(exc),
+                )
             except Exception as exc:
                 cleanup_allowed = False
-                _report_error(report, None, f"new card creation failed: {type(exc).__name__}: {exc}")
+                _report_error(
+                    report,
+                    None,
+                    f"new card creation failed ({type(exc).__name__}): {exc}",
+                    card_name=str(parsed.projection.get("title") or ""),
+                    advice=_failure_advice(exc),
+                )
 
         local_documents, _, rescan_complete = _load_local_documents(config.plan_dir, config, report)
         scan_complete = scan_complete and rescan_complete
@@ -3999,6 +4205,7 @@ def sync_once(
             bundles,
             local_documents,
             occupied_names=(path.name for path in config.plan_dir.glob("*.md")),
+            plan_dir=config.plan_dir,
         )
         occupied_names = {path.name.casefold() for path in config.plan_dir.glob("*.md")}
         occupied_names.update(name.casefold() for name in filenames.values())
@@ -4010,7 +4217,12 @@ def sync_once(
                 continue
             projection = build_remote_projection(bundle)
             recovered_name = choose_filename(
-                projection["status"], projection["title"], card_id, duplicate=True, suffix=suffix
+                projection["status"],
+                projection["title"],
+                card_id,
+                duplicate=True,
+                suffix=suffix,
+                plan_dir=config.plan_dir,
             )
             if recovered_name.casefold() not in occupied_names:
                 occupied_names.discard(filenames[card_id].casefold())
@@ -4048,10 +4260,22 @@ def sync_once(
                 if exc.status == 401:
                     raise
                 cleanup_allowed = False
-                _report_error(report, card_id, f"card processing failed: {type(exc).__name__}")
+                _report_error(
+                    report,
+                    card_id,
+                    f"card processing failed ({type(exc).__name__}): {exc}",
+                    card_name=str((bundles[card_id].get("card") or {}).get("name") or ""),
+                    advice=_failure_advice(exc),
+                )
             except Exception as exc:
                 cleanup_allowed = False
-                _report_error(report, card_id, f"card processing failed: {type(exc).__name__}: {exc}")
+                _report_error(
+                    report,
+                    card_id,
+                    f"card processing failed ({type(exc).__name__}): {exc}",
+                    card_name=str((bundles[card_id].get("card") or {}).get("name") or ""),
+                    advice=_failure_advice(exc),
+                )
         missing_documents = [
             (card_id, parsed)
             for card_id, parsed in sorted(local_documents.items())
@@ -4107,18 +4331,48 @@ def sync_once(
                     recovery_path = _remove_to_recovery(parsed, config.plan_dir, current_time, "card_absent_after_recheck")
                     report["recovery_paths"].append(str(recovery_path.relative_to(config.plan_dir)))
                     report["removed"] += 1
-                    report["failures"] += 1
-                    report["errors"].append({"card_id": card_id, "message": "card no longer accessible; backup created"})
+                    _report_error(
+                        report,
+                        card_id,
+                        "Card is not accessible in Trello after a second check; file moved to "
+                        f"recovery at {report['recovery_paths'][-1]}.",
+                        card_name=str(parsed.projection.get("title") or ""),
+                        advice=_failure_advice(RemoteError("card not found", status=404)),
+                    )
                 elif state == "same_list":
-                    _report_error(report, card_id, "card was missing from a complete board inventory")
+                    _report_error(
+                        report,
+                        card_id,
+                        "The card is in the Trello list but was missing from the complete inventory.",
+                        card_name=str(parsed.projection.get("title") or ""),
+                        advice="Run sync.py again. If it happens again, keep the local file and "
+                        "share this full message for investigation.",
+                    )
                 else:
-                    _report_error(report, card_id, f"card absence could not be classified: {state}")
+                    _report_error(
+                        report,
+                        card_id,
+                        f"card absence could not be classified: {state}",
+                        card_name=str(parsed.projection.get("title") or ""),
+                    )
             except RemoteError as exc:
                 if exc.status == 401:
                     raise
-                _report_error(report, card_id, f"card removal check failed: {type(exc).__name__}")
+                _report_error(
+                    report,
+                    card_id,
+                    f"card removal check failed ({type(exc).__name__}): {exc}",
+                    card_name=str(parsed.projection.get("title") or ""),
+                    advice=_failure_advice(exc),
+                )
             except Exception as exc:
-                _report_error(report, card_id, f"card removal check failed: {type(exc).__name__}: {exc}")
+                _report_error(
+                    report,
+                    card_id,
+                    f"card removal check failed ({type(exc).__name__}): {exc}",
+                    card_name=str(parsed.projection.get("title") or ""),
+                    advice=_failure_advice(exc),
+                )
         if not cleanup_allowed and not report["cleanup_skipped"]:
             report["cleanup_skipped"].append(
                 {"card_id": None, "reason": "inventory_or_local_scan_incomplete"}
@@ -4126,7 +4380,13 @@ def sync_once(
         elapsed = time.monotonic() - started_at
         request_count = getattr(client, "request_count", None)
         request_note = f" ({request_count} consultas ao Trello)" if isinstance(request_count, int) else ""
-        _emit_progress(progress, f"Synchronization completed in {elapsed:.1f}s{request_note}.")
+        if report["failures"]:
+            completion = "finished with errors"
+        elif report["conflicts"]:
+            completion = "finished with conflicts"
+        else:
+            completion = "completed"
+        _emit_progress(progress, f"Synchronization {completion} in {elapsed:.1f}s{request_note}.")
         return report
 
 
@@ -4157,9 +4417,26 @@ def _print_report(report: Mapping[str, Any], *, output: Any = sys.stdout, errors
         print("No changes.", file=output)
     for recovery_path in report.get("recovery_paths", []):
         print(f"RECOVERY {recovery_path}", file=output)
+    if report.get("failures"):
+        print(
+            "SyncAssist: Partial synchronization. Review the details and next steps for each error below.",
+            file=errors,
+        )
+    if report.get("cleanup_skipped"):
+        print(
+            "WARNING [project] Automatic cleanup was skipped because the Trello inventory or local "
+            "scan was incomplete; missing local files were kept. Fix the errors above and run "
+            "sync.py again.",
+            file=errors,
+        )
     for error in report.get("errors", []):
         card_id = error.get("card_id") or "project"
-        print(f"ERROR [{card_id}] {error['message']}", file=errors)
+        card_name = error.get("card_name")
+        label = f" ({' '.join(str(card_name).split())})" if card_name else ""
+        message = " ".join(str(error["message"]).split())
+        print(f"ERROR [{card_id}]{label}: {message}", file=errors)
+        if error.get("advice"):
+            print(f"  Next step: {' '.join(str(error['advice']).split())}", file=errors)
     for warning in report.get("warnings", []):
         card_id = warning.get("card_id") or "project"
         print(f"WARNING [{card_id}] {warning['message']}", file=errors)
@@ -4334,12 +4611,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except ConfigError as exc:
         print(f"ERROR configuration: {exc}", file=sys.stderr)
+        print(
+            "Next step: check .env and confirm that the configured Trello board and list are still active.",
+            file=sys.stderr,
+        )
         return 2
     except RemoteError as exc:
         print(f"ERROR Trello: {exc}", file=sys.stderr)
+        print(f"Next step: {_failure_advice(exc)}", file=sys.stderr)
         return 3 if exc.status in {401, 403} else 1
     except SyncAssistError as exc:
         print(f"ERROR SyncAssist: {exc}", file=sys.stderr)
+        print(f"Next step: {_failure_advice(exc)}", file=sys.stderr)
         return 1
 
 

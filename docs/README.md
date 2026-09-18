@@ -4,9 +4,9 @@ Local digital secretary for synchronizing a Trello list with a project's Markdow
 
 Each copy of `sync.py` represents one Trello list. When the script runs, it creates `PLAN/` and writes one file per card. The card ID is stored in the file's metadata, so title changes do not break the link.
 
-Runtime version: `1.2.0`. See [CHANGELOG.md](CHANGELOG.md) for the release history.
+Runtime version: `1.2.4`. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-The implementation is covered by 119 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
+The implementation is covered by 123 passing standard-library tests on Python 3.13.7. No Linux or macOS environment was available here.
 
 ## Requirements
 
@@ -60,6 +60,8 @@ The script has no positional arguments. The recommended flow is to configure onc
 `--setup` and `--import` are mutually exclusive. The full help is kept beside the implementation so it stays aligned with the actual CLI.
 
 During synchronization the terminal shows the current phase and card, for example `Reading card 2/5` and `Syncing card 2/5`. The script reads complementary Trello resources sequentially to respect the API limit, so a card can require several requests. Rate-limit responses and retries are announced with the wait time, and the final line includes the elapsed time and number of Trello requests.
+
+When a card fails, the report includes its ID and title, the detailed Trello or local error, and a suggested next step. It also says when that card's local file was not created or updated, when the run was partial, and why automatic cleanup was skipped. Existing Trello titles and descriptions over the write limit are preserved; new or edited values still obey Trello's limits. On Windows, generated card filenames are shortened further when the full project path approaches `MAX_PATH`; the full title remains in the Markdown document.
 
 The raw reference keeps the card, list, board, labels, checklists/items, actions, attachments, members, custom-field values and definitions, votes, stickers and Power-Up data when the API exposes them. Each complementary resource has a `complete`, `empty`, `unsupported` or `failed` status. A transient or failed resource is never silently replaced with an empty list: the previous section is retained when available, the card is not rewritten from that incomplete bundle, and cleanup is disabled for the run. A 403/404 optional endpoint is recorded as unsupported and does not block unrelated cards.
 
@@ -116,7 +118,7 @@ Renaming the file prefix checks or unchecks only the native due-date checkbox. W
 
 ## File names
 
-The full title remains in the document. The filename is a short, normalized slug compatible with Windows, Linux and macOS:
+The full title remains in the document. The filename is a short, normalized slug compatible with Windows, Linux and macOS. On Windows, SyncAssist shortens it further when needed to fit the full project path:
 
 ```text
 todo-configurar-api.md
